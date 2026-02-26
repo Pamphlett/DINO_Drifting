@@ -120,17 +120,6 @@ def reset_normal_metrics(mean_ae_m, median_ae_m, rmse_m, a1_m, a2_m, a3_m, a4_m,
     a5_m.reset()
 
 
-class NoiseEmbedding(nn.Module):
-    def __init__(self, noise_dim, token_dim):
-        super().__init__()
-        self.noise_dim = noise_dim
-        self.proj = nn.Linear(noise_dim, token_dim)
-
-    def forward(self, batch_size, device):
-        eps = torch.randn(batch_size, self.noise_dim, device=device)
-        return self.proj(eps).unsqueeze(1)
-
-
 class Dino_f(pl.LightningModule):
     def __init__(self,args):
         super(Dino_f,self).__init__()
@@ -187,13 +176,6 @@ class Dino_f(pl.LightningModule):
         self.drift_metric_token_cap = max(8, int(getattr(args, "drift_metric_token_cap", 512)))
         self.drift_train_token_cap = max(0, int(getattr(args, "drift_train_token_cap", 0)))
         self.drift_diversity_k = max(2, int(getattr(args, "drift_diversity_k", 3)))
-        self.noise_dim = int(getattr(args, "noise_dim", 256))
-        self.drift_step_size = max(0.0, float(getattr(args, "drift_step_size", 0.25)))
-        self.drift_anchor_weight = float(getattr(args, "drift_anchor_weight", 0.5))
-        self.drift_anchor_weight = min(1.0, max(0.0, self.drift_anchor_weight))
-        self.drift_loss_mode = str(getattr(args, "drift_loss_mode", "hybrid")).lower()
-        if self.drift_loss_mode not in {"hybrid", "pure"}:
-            raise ValueError(f"Unsupported drift_loss_mode: {self.drift_loss_mode}")
         self.drift_v_clip = max(0.0, float(getattr(args, "drift_v_clip", 50.0)))
         self.drift_all_gather_neg = bool(getattr(args, "drift_all_gather_neg", False))
         self.drift_adaptive_temp = bool(getattr(args, "drift_adaptive_temp", False))
@@ -206,9 +188,6 @@ class Dino_f(pl.LightningModule):
         if self._drift_temp_ref_dist <= 0.0:
             self._drift_temp_ref_dist = None
         self._drift_temp_scale_ema = 1.0
-        self.noise_embedding = NoiseEmbedding(self.noise_dim, self.hidden_dim) if self.use_drifting_loss else None
-        if self.use_drifting_loss and args.seperable_attention:
-            raise ValueError("Drifting objective currently requires --seperable_attention disabled.")
         self.use_language_condition = args.use_language_condition
         self.use_precomputed_text = getattr(args, "use_precomputed_text", False)
         if self.use_language_condition:
@@ -769,11 +748,6 @@ class Dino_f(pl.LightningModule):
             x = self.pca_inverse_transform(x)
         return x
 
-    def _sample_noise_token(self, batch_size, device):
-        if not self.use_drifting_loss or self.noise_embedding is None:
-            return None
-        return self.noise_embedding(batch_size=batch_size, device=device)
-
     def _is_dist_ready(self):
         return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
@@ -798,70 +772,86 @@ class Dino_f(pl.LightningModule):
         chunks = [g[:sizes[i]] for i, g in enumerate(gathered) if sizes[i] > 0]
         return torch.cat(chunks, dim=0) if chunks else tensor[:0]
 
-    def _predict_sequence(self, masked_x, text_tokens=None, text_mask=None, noise_token=None):
-        if self.use_drifting_loss and noise_token is None:
-            noise_token = self._sample_noise_token(masked_x.shape[0], masked_x.device)
+    def _predict_sequence(self, masked_x, text_tokens=None, text_mask=None):
         if self.args.vis_attn:
             x_pred, attn = self.maskvit(
                 masked_x,
                 return_attn=True,
                 text_tokens=text_tokens,
                 text_mask=text_mask,
-                noise_token=noise_token,
             )
         else:
             x_pred, = self.maskvit(
                 masked_x,
                 text_tokens=text_tokens,
                 text_mask=text_mask,
-                noise_token=noise_token,
             )
             attn = None
         x_pred = einops.rearrange(x_pred, 'b (sl h w) c -> b sl h w c', sl=self.shape[0], h=self.shape[1], w=self.shape[2])
         x_pred = self.activation(x_pred)
         return x_pred, attn
 
-    def _drift_training_step(self, x, masked_x, mask, text_tokens=None, text_mask=None):
-        B = x.shape[0]
-        noise_token = self._sample_noise_token(B, x.device)
+    def _build_drift_input_tokens(self, x):
+        B, T, H, W, C = x.shape
+        noise = torch.randn(B, H, W, C, device=x.device, dtype=x.dtype)
+        x_input = x.clone()
+        x_input[:, -1] = noise
+        if self.masking == "simple_replace":
+            final_tokens = self.embed(x_input)
+        elif self.masking in ("half_half", "half_half_previous"):
+            embedded_tokens = self.embed(x_input)
+            unmask_all = self.unmask_vector.expand(B, T, H, W, -1)
+            final_tokens = torch.cat((embedded_tokens, unmask_all), dim=-1)
+        else:
+            raise ValueError(f"Unsupported masking mode for drifting: {self.masking}")
+        return final_tokens
+
+    def _drift_training_step(self, x, text_tokens=None, text_mask=None):
+        """
+        Drifting training step following Algorithm 1 of Deng et al. (2026).
+        """
+        B, _, H, W, C = x.shape
+        final_tokens = self._build_drift_input_tokens(x)
         x_pred, _ = self._predict_sequence(
-            masked_x,
+            final_tokens,
             text_tokens=text_tokens,
             text_mask=text_mask,
-            noise_token=noise_token,
         )
 
-        x_pred_next = x_pred[:, -1]
-        y_gt_next = x[:, -1]
-        n_tok = x_pred_next.shape[1] * x_pred_next.shape[2]
-        x_tokens = x_pred_next.reshape(B * n_tok, x_pred_next.shape[-1])
-        y_tokens = y_gt_next.reshape(B * n_tok, y_gt_next.shape[-1])
+        x_gen = x_pred[:, -1]
+        y_pos = x[:, -1]
+        n_tok = H * W
+        x_tokens = x_gen.reshape(B * n_tok, C)
+        y_pos_tokens = y_pos.reshape(B * n_tok, C)
         sample_ids = build_token_sample_ids(B, n_tok, x_tokens.device)
         token_subset_idx = None
         if self.drift_train_token_cap > 0 and x_tokens.shape[0] > self.drift_train_token_cap:
             token_subset_idx = torch.randperm(x_tokens.shape[0], device=x_tokens.device)[: self.drift_train_token_cap]
             x_tokens = x_tokens[token_subset_idx]
-            y_tokens = y_tokens[token_subset_idx]
+            y_pos_tokens = y_pos_tokens[token_subset_idx]
             sample_ids = sample_ids[token_subset_idx]
-        if self._is_dist_ready():
-            # Make sample ids globally unique across ranks before any cross-rank gathering.
-            sample_ids = sample_ids + (int(dist.get_rank()) << 32)
 
         # Drift kernels are numerically sensitive in mixed precision; force fp32 math.
         with torch.autocast(device_type=x.device.type, enabled=False):
             x_tokens_fp32 = torch.nan_to_num(x_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            y_tokens_fp32 = torch.nan_to_num(y_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            y_pos_tokens_fp32 = torch.nan_to_num(y_pos_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
             y_neg_tokens_fp32 = x_tokens_fp32
+
             y_neg_sample_ids = sample_ids
             if self.drift_all_gather_neg and self._is_dist_ready():
-                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(y_neg_tokens_fp32)
-                y_neg_sample_ids = self._all_gather_variable_first_dim(y_neg_sample_ids)
+                sample_ids_for_neg = sample_ids + (int(dist.get_rank()) << 32)
+                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(x_tokens_fp32.detach())
+                y_neg_sample_ids = self._all_gather_variable_first_dim(sample_ids_for_neg)
+
+            if self._is_dist_ready():
+                sample_ids = sample_ids + (int(dist.get_rank()) << 32)
+
             drift_temperatures, drift_temp_scale, drift_temp_dist = self._resolve_drift_temperatures(
-                x_tokens_fp32, y_tokens_fp32
+                x_tokens_fp32, y_pos_tokens_fp32
             )
             V = compute_V(
                 x=x_tokens_fp32,
-                y_pos=y_tokens_fp32,
+                y_pos=y_pos_tokens_fp32,
                 y_neg=y_neg_tokens_fp32,
                 temperatures=drift_temperatures,
                 x_sample_ids=sample_ids,
@@ -874,43 +864,30 @@ class Dino_f(pl.LightningModule):
                 v_norm = V.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                 clip_scale = (self.drift_v_clip / v_norm).clamp(max=1.0)
                 V = V * clip_scale
-            x_drifted = x_tokens_fp32 + self.drift_step_size * V.detach()
-            loss_anchor = F.mse_loss(x_tokens_fp32, y_tokens_fp32)
-            loss_drift_step = F.mse_loss(x_drifted, y_tokens_fp32)
-            loss_pure = F.mse_loss(x_tokens_fp32, x_drifted.detach())
-            if self.drift_loss_mode == "pure":
-                loss = loss_pure
-            else:
-                loss = (1.0 - self.drift_anchor_weight) * loss_anchor + self.drift_anchor_weight * loss_drift_step
+
+            x_drifted = (x_tokens_fp32 + V).detach()
+            loss = F.mse_loss(x_tokens_fp32, x_drifted)
             if not torch.isfinite(loss):
                 if self.global_rank == 0:
                     print(
                         "[DriftDebug] non-finite loss detected: "
-                        f"loss_anchor={loss_anchor.item():.4e} "
-                        f"loss_drift_step={loss_drift_step.item():.4e} "
-                        f"loss_pure={loss_pure.item():.4e} "
                         f"x_absmax={x_tokens_fp32.abs().max().item():.4e} "
-                        f"y_absmax={y_tokens_fp32.abs().max().item():.4e} "
+                        f"y_absmax={y_pos_tokens_fp32.abs().max().item():.4e} "
                         f"v_absmax={V.abs().max().item():.4e}"
                     )
                 loss = x_tokens_fp32.sum() * 0.0
 
         metrics = {
             "Train/l_drift": loss.detach(),
-            "Train/l_anchor": loss_anchor.detach(),
-            "Train/l_drift_step": loss_drift_step.detach(),
-            "Train/l_drift_pure": loss_pure.detach(),
-            "Train/drift_mode_pure": x_tokens_fp32.new_tensor(1.0 if self.drift_loss_mode == "pure" else 0.0),
             "Train/drift_v_sq_norm": V.detach().pow(2).sum(dim=-1).mean(),
             "Train/drift_v_sq_norm_raw": v_sq_norm_raw,
-            "Train/drift_cos_to_gt": F.cosine_similarity(x_tokens_fp32.detach(), y_tokens_fp32.detach(), dim=-1).mean(),
+            "Train/drift_cos_to_gt": F.cosine_similarity(x_tokens_fp32.detach(), y_pos_tokens_fp32.detach(), dim=-1).mean(),
             "Train/drift_neg_pool_tokens": x_tokens_fp32.new_tensor(float(y_neg_tokens_fp32.shape[0])),
             "Train/drift_temp_scale": x_tokens_fp32.new_tensor(float(drift_temp_scale)),
             "Train/drift_temp_ref_dist": x_tokens_fp32.new_tensor(
                 float(self._drift_temp_ref_dist) if self._drift_temp_ref_dist is not None else 0.0
             ),
-            "Train/pred_batch_std": x_pred_next.detach().reshape(B, -1).std(dim=0, unbiased=False).mean(),
-            "Train/mask_ratio": mask[:, -1].float().mean() * 100.0,
+            "Train/pred_batch_std": x_gen.detach().reshape(B, -1).std(dim=0, unbiased=False).mean(),
         }
         if drift_temp_dist is not None:
             metrics["Train/drift_temp_measured_dist"] = x_tokens_fp32.new_tensor(float(drift_temp_dist))
@@ -922,18 +899,26 @@ class Dino_f(pl.LightningModule):
             with torch.no_grad():
                 samples = [x_tokens_fp32.detach()]
                 for _ in range(self.drift_diversity_k - 1):
+                    final_tokens_alt = self._build_drift_input_tokens(x)
                     pred_alt, _ = self._predict_sequence(
-                        masked_x,
+                        final_tokens_alt,
                         text_tokens=text_tokens,
                         text_mask=text_mask,
-                        noise_token=self._sample_noise_token(B, x.device),
                     )
-                    alt_tokens = torch.nan_to_num(pred_alt[:, -1].reshape(B * n_tok, -1).float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                    alt_tokens = torch.nan_to_num(
+                        pred_alt[:, -1].reshape(B * n_tok, -1).float(),
+                        nan=0.0,
+                        posinf=1e4,
+                        neginf=-1e4,
+                    )
                     if token_subset_idx is not None:
                         alt_tokens = alt_tokens[token_subset_idx]
                     samples.append(alt_tokens)
 
-                metrics["Train/noise_sensitivity"] = F.cosine_similarity(samples[0], samples[1], dim=-1).mean()
+                if len(samples) >= 2:
+                    diversity_cos = F.cosine_similarity(samples[0], samples[1], dim=-1).mean()
+                    metrics["Train/drift_diversity_cos"] = diversity_cos
+                    metrics["Train/noise_sensitivity"] = diversity_cos
                 pairwise_cos = []
                 for i in range(len(samples)):
                     for j in range(i + 1, len(samples)):
@@ -945,7 +930,7 @@ class Dino_f(pl.LightningModule):
                     token_cap = min(self.drift_metric_token_cap, x_tokens.shape[0])
                     idx = torch.randperm(x_tokens.shape[0], device=x.device)[:token_cap]
                     x_ref = x_tokens_fp32.detach()[idx]
-                    y_pos_ref = y_tokens_fp32.detach()[idx]
+                    y_pos_ref = y_pos_tokens_fp32.detach()[idx]
                     y_neg_ref = x_tokens_fp32.detach()[idx[torch.randperm(token_cap, device=x.device)]]
                     v_ab = compute_V(x=x_ref, y_pos=y_pos_ref, y_neg=y_neg_ref, temperatures=drift_temperatures)
                     v_ba = compute_V(x=x_ref, y_pos=y_neg_ref, y_neg=y_pos_ref, temperatures=drift_temperatures)
@@ -975,6 +960,31 @@ class Dino_f(pl.LightningModule):
         with torch.no_grad():
             x = self.preprocess(x)
             B, SL, H, W, C = x.shape
+            if self.use_drifting_loss:
+                if self.args.sliding_window_inference:
+                    window_size = (16,32)
+                    stride = (16,32)
+                    x_wins = self.sliding_window(x, window_size, stride)
+                    wins = []
+                    for i in range(x_wins.shape[0]):
+                        win = x_wins[i]
+                        final_tokens = self._build_drift_input_tokens(win)
+                        x_pred, _ = self._predict_sequence(final_tokens)
+                        pred_win = win.clone()
+                        pred_win[:, -1] = x_pred[:, -1]
+                        wins.append(pred_win)
+                    prediction = self.merge_windows(torch.stack(wins), (B, SL, H, W, C), window_size, stride).to(x.device)
+                else:
+                    if self.args.crop_feats:
+                        x = self.crop_feats(x)
+                        B, SL, H, W, C = x.shape
+                    final_tokens = self._build_drift_input_tokens(x)
+                    x_pred, _ = self._predict_sequence(final_tokens)
+                    prediction = x.clone()
+                    prediction[:, -1] = x_pred[:, -1]
+                prediction = self.postprocess(prediction)
+                loss = torch.tensor(0.0, device=x.device)
+                return prediction, loss
             if not self.args.sliding_window_inference:
                 if self.args.crop_feats:
                     x = self.crop_feats(x)
@@ -1021,6 +1031,29 @@ class Dino_f(pl.LightningModule):
             x = self.preprocess(x)
         B, SL, H, W, C = x.shape
         for i in range(unroll_steps):
+            if self.use_drifting_loss:
+                with torch.no_grad():
+                    if not self.args.sliding_window_inference:
+                        final_tokens = self._build_drift_input_tokens(x)
+                        x_pred, _ = self._predict_sequence(final_tokens)
+                        final_tokens = x.clone()
+                        final_tokens[:, -1] = x_pred[:, -1]
+                    else:
+                        window_size = (16,32)
+                        stride = (16,32)
+                        x_s = self.sliding_window(x, window_size, stride)
+                        wins = []
+                        for j in range(x_s.shape[0]):
+                            win = x_s[j]
+                            drift_tokens = self._build_drift_input_tokens(win)
+                            x_pred_win, _ = self._predict_sequence(drift_tokens)
+                            pred_win = win.clone()
+                            pred_win[:, -1] = x_pred_win[:, -1]
+                            wins.append(pred_win)
+                        final_tokens = self.merge_windows(torch.stack(wins), (B, SL, H, W, C), window_size, stride).to(x.device)
+                x[:,-1] = final_tokens[:,-1]
+                x = torch.cat((x[:,1:], x[:,-1].unsqueeze(1)), dim=1)
+                continue
             if not self.args.sliding_window_inference:
                 masked_soft_tokens, mask = self.get_mask_tokens(x, mode="full_mask",mask_frames=mask_frames)
                 mask = mask.to(x.device)
@@ -1109,11 +1142,8 @@ class Dino_f(pl.LightningModule):
         if self.args.crop_feats:
             x = self.crop_feats(x)
         if self.use_drifting_loss:
-            masked_x, mask = self.get_mask_tokens(x, mode="full_mask", mask_frames=1)
             loss, drift_metrics = self._drift_training_step(
                 x,
-                masked_x,
-                mask,
                 text_tokens=text_tokens,
                 text_mask=text_mask,
             )

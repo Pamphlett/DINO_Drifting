@@ -281,14 +281,6 @@ class MaskTransformer(nn.Module):
         vid_token_embeddings = self.pos_embd(vid_token) 
         x = einops.rearrange(vid_token_embeddings, 'b t h w c -> b (t h w) c')
         base_tokens = t * h * w
-        if noise_token is not None:
-            if self.seperable_attention:
-                raise ValueError("Noise-token conditioning requires non-separable attention.")
-            if noise_token.dim() == 2:
-                noise_token = noise_token.unsqueeze(1)
-            if noise_token.dim() != 3 or noise_token.shape[0] != b:
-                raise ValueError("noise_token must have shape [B, K, C] or [B, C].")
-            x = torch.cat([x, noise_token], dim=1)
 
         # transformer forward pass
         x = self.first_layer(x)

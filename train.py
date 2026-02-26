@@ -145,17 +145,7 @@ def main():
     parser.add_argument('--loss_type', type=str, default='SmoothL1',choices=['SmoothL1', 'MSE','L1'])
     parser.add_argument('--beta_smoothl1', type=float, default=0.1)
     parser.add_argument('--use_drifting_loss', action='store_true', default=False)
-    parser.add_argument('--noise_dim', type=int, default=256)
     parser.add_argument('--drift_temperatures', type=parse_float_list, default=[0.02, 0.05, 0.2])
-    parser.add_argument('--drift_step_size', type=float, default=0.25, help='Step size for x + step_size * V before drift supervision.')
-    parser.add_argument('--drift_anchor_weight', type=float, default=0.5, help='Mix between anchor MSE(x, y) and drift-step MSE(x+V, y).')
-    parser.add_argument(
-        '--drift_loss_mode',
-        type=str,
-        default='hybrid',
-        choices=['hybrid', 'pure'],
-        help='Drifting objective mode: hybrid=(1-a)MSE(x,y)+aMSE(x+V,y), pure=MSE(x,stopgrad(x+step*V)).',
-    )
     parser.add_argument('--drift_v_clip', type=float, default=50.0, help='Per-token L2 clip on drift vectors V (0 disables clipping).')
     parser.add_argument('--drift_all_gather_neg', action='store_true', default=False,
                         help='All-gather prediction tokens across DDP ranks to enlarge the negative pool for drifting.')

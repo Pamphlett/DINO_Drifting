@@ -17,11 +17,8 @@
   VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-1.0}"
   NUM_SANITY_VAL_STEPS="${NUM_SANITY_VAL_STEPS:-0}"
   DDP_TIMEOUT="${DDP_TIMEOUT:-1800}"
-  DRIFT_LOSS_MODE="${DRIFT_LOSS_MODE:-hybrid}"
   DRIFT_TEMPERATURES="${DRIFT_TEMPERATURES:-0.05,0.1,0.2}"
   DRIFT_ADAPTIVE_TEMP="${DRIFT_ADAPTIVE_TEMP:-0}"
-  DRIFT_STEP_SIZE="${DRIFT_STEP_SIZE:-0.03}"
-  DRIFT_ANCHOR_WEIGHT="${DRIFT_ANCHOR_WEIGHT:-0.1}"
   DRIFT_V_CLIP="${DRIFT_V_CLIP:-10}"
 
   OPENDV_ROOT="/pfs/pengyu/OpenDV-YouTube"
@@ -69,7 +66,7 @@
   echo "TRAIN_PY=${TRAIN_PY}"
   echo "DDP_TIMEOUT=${DDP_TIMEOUT}"
   echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} VAL_CHECK_INTERVAL=${VAL_CHECK_INTERVAL}"
-  echo "DRIFT: mode=${DRIFT_LOSS_MODE} temps=${DRIFT_TEMPERATURES} adaptive=${DRIFT_ADAPTIVE_TEMP} step=${DRIFT_STEP_SIZE} anchor=${DRIFT_ANCHOR_WEIGHT} vclip=${DRIFT_V_CLIP}"
+  echo "DRIFT: temps=${DRIFT_TEMPERATURES} adaptive=${DRIFT_ADAPTIVE_TEMP} vclip=${DRIFT_V_CLIP}"
 
   DRIFT_ADAPTIVE_FLAG=()
   if [ "${DRIFT_ADAPTIVE_TEMP}" = "1" ]; then
@@ -91,8 +88,7 @@
     --sequence_length 5 --img_size 224,448 \
     --hidden_dim 768 --heads 8 --layers 8 --dropout 0.1 \
     --single_step_sample_train \
-    --use_drifting_loss --noise_dim 256 \
-    --drift_loss_mode "${DRIFT_LOSS_MODE}" \
+    --use_drifting_loss \
     --drift_temperatures "${DRIFT_TEMPERATURES}" \
     "${DRIFT_ADAPTIVE_FLAG[@]}" \
     --drift_temp_ema_decay 0.95 \
@@ -101,8 +97,6 @@
     --drift_temp_min_scale 0.5 \
     --drift_temp_max_scale 2.0 \
     --drift_temp_ref_dist 0.0 \
-    --drift_step_size "${DRIFT_STEP_SIZE}" \
-    --drift_anchor_weight "${DRIFT_ANCHOR_WEIGHT}" \
     --drift_v_clip "${DRIFT_V_CLIP}" \
     --drift_log_interval 20 --drift_antisymmetry_interval 400 \
     --drift_metric_token_cap "${DRIFT_METRIC_TOKEN_CAP}" \

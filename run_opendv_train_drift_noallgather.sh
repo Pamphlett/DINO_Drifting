@@ -59,10 +59,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node="${NGPU}" --master_addr "${MAS
   --sequence_length 5 --img_size 224,448 \
   --hidden_dim 768 --heads 8 --layers 8 --dropout 0.1 \
   --single_step_sample_train \
-  --use_drifting_loss --noise_dim 256 \
+  --use_drifting_loss \
   --drift_temperatures 0.02,0.05,0.2 \
-  --drift_step_size 0.1 \
-  --drift_anchor_weight 0.3 \
   --drift_v_clip 20 \
   --drift_log_interval 20 --drift_antisymmetry_interval 400 \
   --drift_metric_token_cap 256 --drift_diversity_k 2 \
