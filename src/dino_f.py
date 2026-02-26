@@ -15,7 +15,7 @@ from torchvision.transforms import functional as TF
 import numpy as np
 from torchmetrics import JaccardIndex
 from torchmetrics.aggregation import MeanMetric
-from src.attention_masked import MaskTransformer
+from src.attention_masked import MaskTransformer, StyleEmbedder
 import math
 from dpt import DPTHead
 import timm
@@ -225,6 +225,9 @@ class Dino_f(pl.LightningModule):
             self.replace_vector = nn.Parameter(torch.zeros(1, 1, 1, 1, self.hidden_dim))
             torch.nn.init.normal_(self.replace_vector, std=.02)
             self.maskvit.fc_in = nn.Identity()
+        self.drift_noise_dim = int(getattr(args, "drift_noise_dim", 256))
+        if self.use_drifting_loss:
+            self.style_embedder = StyleEmbedder(self.drift_noise_dim, self.hidden_dim)
         self.activation = nn.Sigmoid() if args.output_activation == "sigmoid" else nn.Identity()
         # Necessary for evaluation
         self.mean_metric = MeanMetric()
@@ -772,19 +775,21 @@ class Dino_f(pl.LightningModule):
         chunks = [g[:sizes[i]] for i, g in enumerate(gathered) if sizes[i] > 0]
         return torch.cat(chunks, dim=0) if chunks else tensor[:0]
 
-    def _predict_sequence(self, masked_x, text_tokens=None, text_mask=None):
+    def _predict_sequence(self, masked_x, text_tokens=None, text_mask=None, cond=None):
         if self.args.vis_attn:
             x_pred, attn = self.maskvit(
                 masked_x,
                 return_attn=True,
                 text_tokens=text_tokens,
                 text_mask=text_mask,
+                cond=cond,
             )
         else:
             x_pred, = self.maskvit(
                 masked_x,
                 text_tokens=text_tokens,
                 text_mask=text_mask,
+                cond=cond,
             )
             attn = None
         x_pred = einops.rearrange(x_pred, 'b (sl h w) c -> b sl h w c', sl=self.shape[0], h=self.shape[1], w=self.shape[2])
@@ -792,18 +797,7 @@ class Dino_f(pl.LightningModule):
         return x_pred, attn
 
     def _build_drift_input_tokens(self, x):
-        B, T, H, W, C = x.shape
-        noise = torch.randn(B, H, W, C, device=x.device, dtype=x.dtype)
-        x_input = x.clone()
-        x_input[:, -1] = noise
-        if self.masking == "simple_replace":
-            final_tokens = self.embed(x_input)
-        elif self.masking in ("half_half", "half_half_previous"):
-            embedded_tokens = self.embed(x_input)
-            unmask_all = self.unmask_vector.expand(B, T, H, W, -1)
-            final_tokens = torch.cat((embedded_tokens, unmask_all), dim=-1)
-        else:
-            raise ValueError(f"Unsupported masking mode for drifting: {self.masking}")
+        final_tokens, _ = self.get_mask_tokens(x, mode="full_mask", mask_frames=1)
         return final_tokens
 
     def _drift_training_step(self, x, text_tokens=None, text_mask=None):
@@ -811,11 +805,14 @@ class Dino_f(pl.LightningModule):
         Drifting training step following Algorithm 1 of Deng et al. (2026).
         """
         B, _, H, W, C = x.shape
+        z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
+        cond = self.style_embedder(z)
         final_tokens = self._build_drift_input_tokens(x)
         x_pred, _ = self._predict_sequence(
             final_tokens,
             text_tokens=text_tokens,
             text_mask=text_mask,
+            cond=cond,
         )
 
         x_gen = x_pred[:, -1]
@@ -899,11 +896,14 @@ class Dino_f(pl.LightningModule):
             with torch.no_grad():
                 samples = [x_tokens_fp32.detach()]
                 for _ in range(self.drift_diversity_k - 1):
+                    z_alt = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
+                    cond_alt = self.style_embedder(z_alt)
                     final_tokens_alt = self._build_drift_input_tokens(x)
                     pred_alt, _ = self._predict_sequence(
                         final_tokens_alt,
                         text_tokens=text_tokens,
                         text_mask=text_mask,
+                        cond=cond_alt,
                     )
                     alt_tokens = torch.nan_to_num(
                         pred_alt[:, -1].reshape(B * n_tok, -1).float(),
@@ -968,8 +968,10 @@ class Dino_f(pl.LightningModule):
                     wins = []
                     for i in range(x_wins.shape[0]):
                         win = x_wins[i]
+                        z = torch.randn(B, self.drift_noise_dim, device=win.device, dtype=win.dtype)
+                        cond = self.style_embedder(z)
                         final_tokens = self._build_drift_input_tokens(win)
-                        x_pred, _ = self._predict_sequence(final_tokens)
+                        x_pred, _ = self._predict_sequence(final_tokens, cond=cond)
                         pred_win = win.clone()
                         pred_win[:, -1] = x_pred[:, -1]
                         wins.append(pred_win)
@@ -978,8 +980,10 @@ class Dino_f(pl.LightningModule):
                     if self.args.crop_feats:
                         x = self.crop_feats(x)
                         B, SL, H, W, C = x.shape
+                    z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
+                    cond = self.style_embedder(z)
                     final_tokens = self._build_drift_input_tokens(x)
-                    x_pred, _ = self._predict_sequence(final_tokens)
+                    x_pred, _ = self._predict_sequence(final_tokens, cond=cond)
                     prediction = x.clone()
                     prediction[:, -1] = x_pred[:, -1]
                 prediction = self.postprocess(prediction)
@@ -1034,8 +1038,10 @@ class Dino_f(pl.LightningModule):
             if self.use_drifting_loss:
                 with torch.no_grad():
                     if not self.args.sliding_window_inference:
+                        z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
+                        cond = self.style_embedder(z)
                         final_tokens = self._build_drift_input_tokens(x)
-                        x_pred, _ = self._predict_sequence(final_tokens)
+                        x_pred, _ = self._predict_sequence(final_tokens, cond=cond)
                         final_tokens = x.clone()
                         final_tokens[:, -1] = x_pred[:, -1]
                     else:
@@ -1045,8 +1051,10 @@ class Dino_f(pl.LightningModule):
                         wins = []
                         for j in range(x_s.shape[0]):
                             win = x_s[j]
+                            z = torch.randn(B, self.drift_noise_dim, device=win.device, dtype=win.dtype)
+                            cond = self.style_embedder(z)
                             drift_tokens = self._build_drift_input_tokens(win)
-                            x_pred_win, _ = self._predict_sequence(drift_tokens)
+                            x_pred_win, _ = self._predict_sequence(drift_tokens, cond=cond)
                             pred_win = win.clone()
                             pred_win[:, -1] = x_pred_win[:, -1]
                             wins.append(pred_win)

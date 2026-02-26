@@ -110,6 +110,6 @@
     --max_epochs 10 --num_sanity_val_steps "${NUM_SANITY_VAL_STEPS}" --limit_val_batches "${LIMIT_VAL_BATCHES}" --val_check_interval "${VAL_CHECK_INTERVAL}" \
     --dst_path "${DST_PATH}" \
     --wandb_project dino-foresight --wandb_name drift_opt_fp16_ddp_noallgather_e10 \
-    --wandb_mode offline \
+    --wandb_mode online \
     --use_tensorboard --tensorboard_name tensorboard \
     --use_csv_logger --csv_logger_name csv

@@ -95,6 +95,35 @@ class CrossAttention(nn.Module):
             attention_value, _ = self.mha(x, context, context)
         return attention_value
 
+
+class StyleEmbedder(nn.Module):
+    """Projects random style noise into the transformer hidden dimension."""
+    def __init__(self, noise_dim, hidden_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(noise_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, z):
+        return self.mlp(z)
+
+
+class AdaLNModulation(nn.Module):
+    """DiT-style adaLN-zero modulation for attention/FFN residual branches."""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6 * hidden_dim),
+        )
+        nn.init.zeros_(self.proj[1].weight)
+        nn.init.zeros_(self.proj[1].bias)
+
+    def forward(self, c):
+        return self.proj(c).chunk(6, dim=-1)
+
 class TransformerEncoder(nn.Module):
     def __init__(self, dim, depth, heads, mlp_dim, dropout=0.):
         """ Initialize the Attention module.
@@ -107,14 +136,16 @@ class TransformerEncoder(nn.Module):
         """
         super().__init__()
         self.layers = nn.ModuleList([])
+        self.adaLN_modulations = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 PreNorm(dim, Attention(dim, heads, dropout=dropout)),
                 PreNorm(dim, CrossAttention(dim, heads, dropout=dropout)),
                 PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout))
             ]))
+            self.adaLN_modulations.append(AdaLNModulation(dim))
 
-    def forward(self, x, full_shape=None, text_tokens=None, text_mask=None):
+    def forward(self, x, full_shape=None, text_tokens=None, text_mask=None, cond=None):
         """ Forward pass through the Attention module.
             :param:
                 x -> torch.Tensor: Input tensor
@@ -123,12 +154,29 @@ class TransformerEncoder(nn.Module):
                 l_attn -> list(torch.Tensor): list of the attention
         """
         l_attn = []
-        for attn, cross_attn, ff in self.layers:
-            attention_value, attention_weight = attn(x)
-            x = attention_value + x
-            if text_tokens is not None:
-                x = cross_attn(x, context=text_tokens, context_mask=text_mask) + x
-            x = ff(x) + x
+        for i, (attn, cross_attn, ff) in enumerate(self.layers):
+            if cond is not None:
+                s1, sh1, g1, s2, sh2, g2 = self.adaLN_modulations[i](cond)
+                s1, sh1, g1 = s1.unsqueeze(1), sh1.unsqueeze(1), g1.unsqueeze(1)
+                s2, sh2, g2 = s2.unsqueeze(1), sh2.unsqueeze(1), g2.unsqueeze(1)
+
+                x_norm = attn.norm(x)
+                x_norm = x_norm * (1 + s1) + sh1
+                attention_value, attention_weight = attn.fn(x_norm)
+                x = x + g1 * attention_value
+
+                if text_tokens is not None:
+                    x = cross_attn(x, context=text_tokens, context_mask=text_mask) + x
+
+                x_norm = ff.norm(x)
+                x_norm = x_norm * (1 + s2) + sh2
+                x = x + g2 * ff.fn(x_norm)
+            else:
+                attention_value, attention_weight = attn(x)
+                x = attention_value + x
+                if text_tokens is not None:
+                    x = cross_attn(x, context=text_tokens, context_mask=text_mask) + x
+                x = ff(x) + x
             l_attn.append(attention_weight)
         return x, l_attn
 
@@ -154,7 +202,7 @@ class TransformerEncoderSeperableAttention(nn.Module):
                 PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout))
             ]))
 
-    def forward(self, x, full_shape, text_tokens=None, text_mask=None):
+    def forward(self, x, full_shape, text_tokens=None, text_mask=None, cond=None):
         """ Forward pass through the Attention module.
             :param:
                 x -> torch.Tensor: Input tensor
@@ -263,6 +311,7 @@ class MaskTransformer(nn.Module):
         text_tokens=None,
         text_mask=None,
         noise_token=None,
+        cond=None,
     ):
         """ Forward.
             :param:
@@ -284,7 +333,13 @@ class MaskTransformer(nn.Module):
 
         # transformer forward pass
         x = self.first_layer(x)
-        x, attn = self.transformer(x, full_shape=[b, t, h, w, c], text_tokens=text_tokens, text_mask=text_mask)
+        x, attn = self.transformer(
+            x,
+            full_shape=[b, t, h, w, c],
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            cond=cond,
+        )
         x = self.last_layer(x)
         x_out = self.fc_out(x)
         x_out = x_out[:, :base_tokens]

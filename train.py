@@ -169,6 +169,8 @@ def main():
     parser.add_argument('--drift_train_token_cap', type=int, default=0,
                         help='Optional cap on token count used by drifting loss cdist/softmax (0 disables subsampling).')
     parser.add_argument('--drift_diversity_k', type=int, default=3)
+    parser.add_argument('--drift_noise_dim', type=int, default=256,
+                        help='Dimension of random style noise z for drifting conditioning.')
     parser.add_argument('--attn_dropout', type=float, default=0.3)
     parser.add_argument('--step', type=int, default=2)
     parser.add_argument('--masking', type=str, default='half_half', choices=['half_half', 'simple_replace', 'half_half_previous'])

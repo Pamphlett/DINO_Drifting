@@ -71,6 +71,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node="${NGPU}" --master_addr "${MAS
   --max_epochs 1 --num_sanity_val_steps 2 --limit_val_batches 0.2 --val_check_interval 0.25 \
   --dst_path "${DST_PATH}" \
   --wandb_project dino-foresight --wandb_name drift_small_fp16_ddp_noallgather_b6a1 \
-  --wandb_mode offline \
+  --wandb_mode online \
   --use_tensorboard --tensorboard_name tensorboard \
   --use_csv_logger --csv_logger_name csv
