@@ -1,0 +1,25 @@
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+
+# Training / experiment artifacts
+wandb/
+lightning_logs/
+dino-foresight/
+logs/
+checkpoints/
+*.ckpt
+*.wandb
+events.out.tfevents*
+
+# Local debug / generated outputs
+*.log
+results.txt
+rgb_decoder_from_feats_val*.png
+rgb_decoder_from_feats_val*_samples/
+
+# Caches / environments
+.history/
+.venv/
+venv/
