@@ -176,6 +176,7 @@ class Dino_f(pl.LightningModule):
         self.drift_metric_token_cap = max(8, int(getattr(args, "drift_metric_token_cap", 512)))
         self.drift_train_token_cap = max(0, int(getattr(args, "drift_train_token_cap", 0)))
         self.drift_diversity_k = max(2, int(getattr(args, "drift_diversity_k", 3)))
+        self.drift_diversity_weight = float(getattr(args, "drift_diversity_weight", 0.1))
         self.drift_v_clip = max(0.0, float(getattr(args, "drift_v_clip", 50.0)))
         self.drift_all_gather_neg = bool(getattr(args, "drift_all_gather_neg", False))
         self.drift_adaptive_temp = bool(getattr(args, "drift_adaptive_temp", False))
@@ -822,6 +823,7 @@ class Dino_f(pl.LightningModule):
         y_pos_tokens = y_pos.reshape(B * n_tok, C)
         sample_ids = build_token_sample_ids(B, n_tok, x_tokens.device)
         token_subset_idx = None
+        div_cos = None
         if self.drift_train_token_cap > 0 and x_tokens.shape[0] > self.drift_train_token_cap:
             token_subset_idx = torch.randperm(x_tokens.shape[0], device=x_tokens.device)[: self.drift_train_token_cap]
             x_tokens = x_tokens[token_subset_idx]
@@ -832,12 +834,14 @@ class Dino_f(pl.LightningModule):
         with torch.autocast(device_type=x.device.type, enabled=False):
             x_tokens_fp32 = torch.nan_to_num(x_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
             y_pos_tokens_fp32 = torch.nan_to_num(y_pos_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            y_neg_tokens_fp32 = x_tokens_fp32
+            y_neg_context = x[:, :-1].reshape(B * (x.shape[1] - 1) * H * W, C)
+            y_neg_tokens_fp32 = torch.nan_to_num(y_neg_context.float(), nan=0.0, posinf=1e4, neginf=-1e4)
 
-            y_neg_sample_ids = sample_ids
+            y_neg_sample_ids = build_token_sample_ids(B * (x.shape[1] - 1), H * W, x_tokens.device)
+            y_neg_sample_ids = y_neg_sample_ids + B + 1  # offset to avoid collision with x/y_pos sample_ids
             if self.drift_all_gather_neg and self._is_dist_ready():
-                sample_ids_for_neg = sample_ids + (int(dist.get_rank()) << 32)
-                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(x_tokens_fp32.detach())
+                sample_ids_for_neg = y_neg_sample_ids + (int(dist.get_rank()) << 32)
+                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(y_neg_tokens_fp32.detach())
                 y_neg_sample_ids = self._all_gather_variable_first_dim(sample_ids_for_neg)
 
             if self._is_dist_ready():
@@ -864,6 +868,25 @@ class Dino_f(pl.LightningModule):
 
             x_drifted = (x_tokens_fp32 + V).detach()
             loss = F.mse_loss(x_tokens_fp32, x_drifted)
+
+            # ---- Diversity regularization ----
+            if self.drift_diversity_weight > 0.0:
+                style_dtype = next(self.style_embedder.parameters()).dtype
+                z2 = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=style_dtype)
+                cond2 = self.style_embedder(z2)
+                with torch.no_grad():
+                    x_pred2, _ = self._predict_sequence(
+                        final_tokens, text_tokens=text_tokens, text_mask=text_mask, cond=cond2
+                    )
+                x_gen2 = x_pred2[:, -1]
+                div_cos = F.cosine_similarity(
+                    x_gen.reshape(B, -1).float(),
+                    x_gen2.reshape(B, -1).float(),
+                    dim=-1,
+                ).mean()
+                loss = loss + self.drift_diversity_weight * div_cos
+            # ---- End diversity regularization ----
+
             if not torch.isfinite(loss):
                 if self.global_rank == 0:
                     print(
@@ -886,6 +909,8 @@ class Dino_f(pl.LightningModule):
             ),
             "Train/pred_batch_std": x_gen.detach().reshape(B, -1).std(dim=0, unbiased=False).mean(),
         }
+        if self.drift_diversity_weight > 0.0 and div_cos is not None:
+            metrics["Train/div_reg_cos"] = div_cos.detach()
         if drift_temp_dist is not None:
             metrics["Train/drift_temp_measured_dist"] = x_tokens_fp32.new_tensor(float(drift_temp_dist))
         if drift_temperatures:
@@ -1345,7 +1370,26 @@ class Dino_f(pl.LightningModule):
                 reset_normal_metrics(self.mean_ae, self.median_ae, self.rmse, self.a1, self.a2, self.a3, self.a4, self.a5)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr, betas=(0.9, 0.999))
-        assert hasattr(self.args, 'max_steps') and self.args.max_steps is not None, f"Must set max_steps argument"
+        adaln_params = []
+        other_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'style_embedder' in name or 'adaLN' in name:
+                adaln_params.append(param)
+            else:
+                other_params.append(param)
+        
+        if adaln_params:
+            print(f"[Optimizer] adaLN params: {len(adaln_params)}, lr={self.args.lr * 10:.6f}")
+            print(f"[Optimizer] other params: {len(other_params)}, lr={self.args.lr:.6f}")
+            optimizer = torch.optim.Adam([
+                {'params': other_params, 'lr': self.args.lr},
+                {'params': adaln_params, 'lr': self.args.lr * 10},
+            ], betas=(0.9, 0.999))
+        else:
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr, betas=(0.9, 0.999))
+        
+        assert hasattr(self.args, 'max_steps') and self.args.max_steps is not None
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args.max_steps)
         return [optimizer], [dict(scheduler=scheduler, interval='step', frequency=1)]

@@ -169,6 +169,8 @@ def main():
     parser.add_argument('--drift_train_token_cap', type=int, default=0,
                         help='Optional cap on token count used by drifting loss cdist/softmax (0 disables subsampling).')
     parser.add_argument('--drift_diversity_k', type=int, default=3)
+    parser.add_argument('--drift_diversity_weight', type=float, default=0.1,
+                        help='Weight for diversity regularization loss.')
     parser.add_argument('--drift_noise_dim', type=int, default=256,
                         help='Dimension of random style noise z for drifting conditioning.')
     parser.add_argument('--attn_dropout', type=float, default=0.3)
@@ -202,6 +204,8 @@ def main():
     parser.add_argument('--single_step_sample_train', action='store_true', default=False)
     parser.add_argument('--precision', type=str, default='32-true',choices=['16-true','16-mixed','32-true', '32'])
     parser.add_argument('--ckpt', type=str, default=None, help='Path of a checkpoint to resume training')
+    parser.add_argument('--ckpt_weights_only', action='store_true', default=False,
+                        help='Load weights from --ckpt with non-strict matching and start a fresh trainer state.')
     parser.add_argument('--num_gpus', type=int, default=1)
     parser.add_argument('--accum_iter', type=int, default=1)
     parser.add_argument('--warmup_p', type=float, default=0.0)
@@ -290,7 +294,10 @@ def main():
     args.lr = (args.lr_base * args.effective_batch_size) / 8 # args.lr_base is specified for an effective batch-size of 8
     print(f'Effective batch size:{args.effective_batch_size} lr_base={args.lr_base} lr={args.lr} max_epochs={args.max_epochs} - max_steps={args.max_steps}')
 
-    if not args.high_res_adapt:
+    if args.ckpt and args.ckpt_weights_only and not args.high_res_adapt:
+        print(f"Loading checkpoint weights only (non-strict): {args.ckpt}")
+        Dino_foresight = Dino_f.load_from_checkpoint(args.ckpt, args=args, strict=False, map_location="cpu")
+    elif not args.high_res_adapt:
         Dino_foresight = Dino_f(args)
     else:
         Dino_foresight = Dino_f.load_from_checkpoint(args.ckpt,args=args,strict=False, map_location="cpu")
@@ -392,7 +399,7 @@ def main():
     _log_stage(args.ddp_stage_log_path, "trainer_created")
 
     if not args.eval_ckpt_only:
-       if args.ckpt and not args.high_res_adapt:
+       if args.ckpt and not args.high_res_adapt and not args.ckpt_weights_only:
            _log_stage(args.ddp_stage_log_path, "fit_start")
            trainer.fit(Dino_foresight,data,ckpt_path=args.ckpt)
        else:
