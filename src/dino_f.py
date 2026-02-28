@@ -834,14 +834,12 @@ class Dino_f(pl.LightningModule):
         with torch.autocast(device_type=x.device.type, enabled=False):
             x_tokens_fp32 = torch.nan_to_num(x_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
             y_pos_tokens_fp32 = torch.nan_to_num(y_pos_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            y_neg_context = x[:, :-1].reshape(B * (x.shape[1] - 1) * H * W, C)
-            y_neg_tokens_fp32 = torch.nan_to_num(y_neg_context.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            y_neg_tokens_fp32 = x_tokens_fp32
 
-            y_neg_sample_ids = build_token_sample_ids(B * (x.shape[1] - 1), H * W, x_tokens.device)
-            y_neg_sample_ids = y_neg_sample_ids + B + 1  # offset to avoid collision with x/y_pos sample_ids
+            y_neg_sample_ids = sample_ids
             if self.drift_all_gather_neg and self._is_dist_ready():
-                sample_ids_for_neg = y_neg_sample_ids + (int(dist.get_rank()) << 32)
-                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(y_neg_tokens_fp32.detach())
+                sample_ids_for_neg = sample_ids + (int(dist.get_rank()) << 32)
+                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(x_tokens_fp32.detach())
                 y_neg_sample_ids = self._all_gather_variable_first_dim(sample_ids_for_neg)
 
             if self._is_dist_ready():
@@ -855,9 +853,9 @@ class Dino_f(pl.LightningModule):
                 y_pos=y_pos_tokens_fp32,
                 y_neg=y_neg_tokens_fp32,
                 temperatures=drift_temperatures,
-                x_sample_ids=sample_ids,
-                y_pos_sample_ids=sample_ids,
-                y_neg_sample_ids=y_neg_sample_ids,
+                x_sample_ids=None,
+                y_pos_sample_ids=None,
+                y_neg_sample_ids=None,
             )
             V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
             v_sq_norm_raw = V.detach().pow(2).sum(dim=-1).mean()
@@ -957,8 +955,24 @@ class Dino_f(pl.LightningModule):
                     x_ref = x_tokens_fp32.detach()[idx]
                     y_pos_ref = y_pos_tokens_fp32.detach()[idx]
                     y_neg_ref = x_tokens_fp32.detach()[idx[torch.randperm(token_cap, device=x.device)]]
-                    v_ab = compute_V(x=x_ref, y_pos=y_pos_ref, y_neg=y_neg_ref, temperatures=drift_temperatures)
-                    v_ba = compute_V(x=x_ref, y_pos=y_neg_ref, y_neg=y_pos_ref, temperatures=drift_temperatures)
+                    v_ab = compute_V(
+                        x=x_ref,
+                        y_pos=y_pos_ref,
+                        y_neg=y_neg_ref,
+                        temperatures=drift_temperatures,
+                        x_sample_ids=None,
+                        y_pos_sample_ids=None,
+                        y_neg_sample_ids=None,
+                    )
+                    v_ba = compute_V(
+                        x=x_ref,
+                        y_pos=y_neg_ref,
+                        y_neg=y_pos_ref,
+                        temperatures=drift_temperatures,
+                        x_sample_ids=None,
+                        y_pos_sample_ids=None,
+                        y_neg_sample_ids=None,
+                    )
                     anti_num = (v_ab + v_ba).norm(dim=-1).mean()
                     anti_den = v_ab.norm(dim=-1).mean().clamp(min=1e-8)
                     metrics["Train/drift_antisymmetry_ratio"] = anti_num / anti_den

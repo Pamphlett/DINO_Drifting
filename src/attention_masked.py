@@ -111,18 +111,17 @@ class StyleEmbedder(nn.Module):
 
 
 class AdaLNModulation(nn.Module):
-    """DiT-style adaLN-zero modulation for attention/FFN residual branches."""
     def __init__(self, hidden_dim):
         super().__init__()
         self.proj = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_dim, 6 * hidden_dim),
+            nn.Linear(hidden_dim, 4 * hidden_dim),  # 4 not 6
         )
-        nn.init.zeros_(self.proj[1].weight)
+        nn.init.normal_(self.proj[1].weight, std=0.02)  # normal not zeros
         nn.init.zeros_(self.proj[1].bias)
 
     def forward(self, c):
-        return self.proj(c).chunk(6, dim=-1)
+        return self.proj(c).chunk(4, dim=-1)  # 4 not 6
 
 class TransformerEncoder(nn.Module):
     def __init__(self, dim, depth, heads, mlp_dim, dropout=0.):
@@ -156,21 +155,21 @@ class TransformerEncoder(nn.Module):
         l_attn = []
         for i, (attn, cross_attn, ff) in enumerate(self.layers):
             if cond is not None:
-                s1, sh1, g1, s2, sh2, g2 = self.adaLN_modulations[i](cond)
-                s1, sh1, g1 = s1.unsqueeze(1), sh1.unsqueeze(1), g1.unsqueeze(1)
-                s2, sh2, g2 = s2.unsqueeze(1), sh2.unsqueeze(1), g2.unsqueeze(1)
+                s1, sh1, s2, sh2 = self.adaLN_modulations[i](cond)
+                s1 = s1.clamp(-2, 2).unsqueeze(1)
+                sh1 = sh1.clamp(-2, 2).unsqueeze(1)
+                s2 = s2.clamp(-2, 2).unsqueeze(1)
+                sh2 = sh2.clamp(-2, 2).unsqueeze(1)
 
-                x_norm = attn.norm(x)
-                x_norm = x_norm * (1 + s1) + sh1
+                x_norm = attn.norm(x) * (1 + s1) + sh1
                 attention_value, attention_weight = attn.fn(x_norm)
-                x = x + g1 * attention_value
+                x = x + attention_value
 
                 if text_tokens is not None:
                     x = cross_attn(x, context=text_tokens, context_mask=text_mask) + x
 
-                x_norm = ff.norm(x)
-                x_norm = x_norm * (1 + s2) + sh2
-                x = x + g2 * ff.fn(x_norm)
+                x_norm = ff.norm(x) * (1 + s2) + sh2
+                x = x + ff.fn(x_norm)
             else:
                 attention_value, attention_weight = attn(x)
                 x = attention_value + x
