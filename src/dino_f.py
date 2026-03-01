@@ -820,46 +820,32 @@ class Dino_f(pl.LightningModule):
         x_gen = x_pred[:, -1]
         y_pos = x[:, -1]
 
-        # Per-location pools: [L, B, C], where L = H * W.
-        x_loc = x_gen.reshape(B, n_tok, C).permute(1, 0, 2).contiguous()
-        y_pos_loc = y_pos.reshape(B, n_tok, C).permute(1, 0, 2).contiguous()
+        # Per-sample pools: [L, N, C], where L = B (each sample is independent),
+        # N = H * W (tokens within that sample form the pool).
+        x_per_sample = x_gen.reshape(B, n_tok, C)
+        y_pos_per_sample = y_pos.reshape(B, n_tok, C)
 
-        loc_subset_idx = None
         div_cos = None
-        if self.drift_train_token_cap > 0 and x_loc.shape[0] * B > self.drift_train_token_cap:
-            loc_cap = max(1, self.drift_train_token_cap // max(B, 1))
-            if loc_cap < x_loc.shape[0]:
-                loc_subset_idx = torch.randperm(x_loc.shape[0], device=x_loc.device)[:loc_cap]
-                x_loc = x_loc[loc_subset_idx]
-                y_pos_loc = y_pos_loc[loc_subset_idx]
 
         # Drift kernels are numerically sensitive in mixed precision; force fp32 math.
         with torch.autocast(device_type=x.device.type, enabled=False):
-            x_loc_fp32 = torch.nan_to_num(x_loc.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            y_pos_loc_fp32 = torch.nan_to_num(y_pos_loc.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            l_eff = x_loc_fp32.shape[0]
+            x_ps_fp32 = torch.nan_to_num(x_per_sample.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            y_pos_ps_fp32 = torch.nan_to_num(y_pos_per_sample.float(), nan=0.0, posinf=1e4, neginf=-1e4)
 
-            if self.drift_all_gather_neg and self._is_dist_ready():
-                gathered_loc = self._all_gather_variable_first_dim(x_loc_fp32.detach())
-                if gathered_loc.shape[0] % l_eff == 0:
-                    world_chunks = gathered_loc.shape[0] // l_eff
-                    y_neg_loc_fp32 = gathered_loc.reshape(world_chunks, l_eff, B, C).permute(1, 0, 2, 3).reshape(l_eff, world_chunks * B, C)
-                else:
-                    y_neg_loc_fp32 = x_loc_fp32
-            else:
-                y_neg_loc_fp32 = x_loc_fp32
+            # neg pool = generated tokens of the same sample
+            y_neg_ps_fp32 = x_ps_fp32
 
-            x_tokens_fp32 = x_loc_fp32.reshape(-1, C)
-            y_pos_tokens_fp32 = y_pos_loc_fp32.reshape(-1, C)
-            y_neg_tokens_fp32 = y_neg_loc_fp32.reshape(-1, C)
+            x_tokens_fp32 = x_ps_fp32.reshape(-1, C)
+            y_pos_tokens_fp32 = y_pos_ps_fp32.reshape(-1, C)
+            y_neg_tokens_fp32 = y_neg_ps_fp32.reshape(-1, C)
 
             drift_temperatures, drift_temp_scale, drift_temp_dist = self._resolve_drift_temperatures(
                 x_tokens_fp32, y_pos_tokens_fp32
             )
             V, drift_diag = compute_V_batched(
-                x=x_loc_fp32,
-                y_pos=y_pos_loc_fp32,
-                y_neg=y_neg_loc_fp32,
+                x=x_ps_fp32,
+                y_pos=y_pos_ps_fp32,
+                y_neg=y_neg_ps_fp32,
                 temperatures=drift_temperatures,
                 return_diagnostics=True,
             )
@@ -870,7 +856,7 @@ class Dino_f(pl.LightningModule):
                 clip_scale = (self.drift_v_clip / v_norm).clamp(max=1.0)
                 V = V * clip_scale
 
-            x_flat = x_loc_fp32.reshape(-1, C)
+            x_flat = x_ps_fp32.reshape(-1, C)
             v_flat = V.reshape(-1, C)
             x_drifted = (x_flat + v_flat).detach()
             loss = F.mse_loss(x_flat, x_drifted)
@@ -940,13 +926,11 @@ class Dino_f(pl.LightningModule):
                         cond=cond_alt,
                     )
                     alt_loc_tokens = torch.nan_to_num(
-                        pred_alt[:, -1].reshape(B, n_tok, -1).permute(1, 0, 2).contiguous().float(),
+                        pred_alt[:, -1].reshape(B, n_tok, -1).contiguous().float(),
                         nan=0.0,
                         posinf=1e4,
                         neginf=-1e4,
                     )
-                    if loc_subset_idx is not None:
-                        alt_loc_tokens = alt_loc_tokens[loc_subset_idx]
                     samples.append(alt_loc_tokens.reshape(-1, alt_loc_tokens.shape[-1]))
 
                 if len(samples) >= 2:
