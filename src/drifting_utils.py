@@ -2,6 +2,7 @@ import math
 from typing import Iterable, Optional
 
 import torch
+import torch.nn.functional as F
 
 
 def build_token_sample_ids(batch_size: int, tokens_per_sample: int, device: torch.device) -> torch.Tensor:
@@ -126,6 +127,7 @@ def compute_V_batched(
     y_pos: torch.Tensor,
     y_neg: torch.Tensor,
     temperatures: Iterable[float] = (0.02, 0.05, 0.2),
+    return_diagnostics: bool = False,
 ) -> torch.Tensor:
     if x.dim() != 3 or y_pos.dim() != 3 or y_neg.dim() != 3:
         raise ValueError("x, y_pos, y_neg must have shape [L, B, C], [L, B, C], [L, B_neg, C].")
@@ -146,12 +148,20 @@ def compute_V_batched(
     b_neg = y_neg.shape[1]
     sqrt_c = math.sqrt(c)
     v_total = torch.zeros_like(x)
+    drift_pos_total = torch.zeros_like(x)
+    drift_neg_total = torch.zeros_like(x)
 
     all_samples = torch.cat([x, y_pos, y_neg], dim=1)
     scale = (_mean_pairwise_l2_batched(all_samples) / sqrt_c).detach().clamp(min=1e-8)
     x_norm = x / scale[:, None, None]
     y_pos_norm = y_pos / scale[:, None, None]
     y_neg_norm = y_neg / scale[:, None, None]
+
+    a_pos = None
+    a_neg = None
+    dist_pos = None
+    dist_neg = None
+    lambda_tau = None
 
     for temperature in temperatures:
         t_eff = float(temperature) * sqrt_c
@@ -180,5 +190,33 @@ def compute_V_batched(
 
         lambda_tau = torch.sqrt(torch.mean(v_tau.pow(2).sum(dim=-1) / c)).detach().clamp(min=1e-8)
         v_total = v_total + (v_tau / lambda_tau)
+        drift_pos_total = drift_pos_total + (drift_pos / lambda_tau)
+        drift_neg_total = drift_neg_total + (drift_neg / lambda_tau)
 
-    return torch.nan_to_num(v_total * scale[:, None, None], nan=0.0, posinf=0.0, neginf=0.0)
+    V = torch.nan_to_num(v_total * scale[:, None, None], nan=0.0, posinf=0.0, neginf=0.0)
+
+    if not return_diagnostics:
+        return V
+
+    drift_pos_scaled = torch.nan_to_num(drift_pos_total * scale[:, None, None], nan=0.0, posinf=0.0, neginf=0.0)
+    drift_neg_scaled = torch.nan_to_num(drift_neg_total * scale[:, None, None], nan=0.0, posinf=0.0, neginf=0.0)
+
+    diagnostics = {
+        "pos_sq_norm": drift_pos_scaled.pow(2).sum(dim=-1).mean(),
+        "neg_sq_norm": drift_neg_scaled.pow(2).sum(dim=-1).mean(),
+        "pos_neg_cos": F.cosine_similarity(
+            drift_pos_scaled.reshape(-1, drift_pos_scaled.shape[-1]),
+            drift_neg_scaled.reshape(-1, drift_neg_scaled.shape[-1]),
+            dim=-1,
+        ).mean(),
+        "scale_mean": scale.mean(),
+        "a_pos_mean": a_pos.mean(),
+        "a_neg_mean": a_neg.mean(),
+        "a_pos_max": a_pos.max(),
+        "a_neg_max": a_neg.max(),
+        "dist_pos_mean": dist_pos.mean(),
+        "dist_neg_mean": dist_neg.mean(),
+        "lambda_last": lambda_tau,
+    }
+
+    return V, diagnostics

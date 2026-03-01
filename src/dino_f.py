@@ -856,11 +856,12 @@ class Dino_f(pl.LightningModule):
             drift_temperatures, drift_temp_scale, drift_temp_dist = self._resolve_drift_temperatures(
                 x_tokens_fp32, y_pos_tokens_fp32
             )
-            V = compute_V_batched(
+            V, drift_diag = compute_V_batched(
                 x=x_loc_fp32,
                 y_pos=y_pos_loc_fp32,
                 y_neg=y_neg_loc_fp32,
                 temperatures=drift_temperatures,
+                return_diagnostics=True,
             )
             V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
             v_sq_norm_raw = V.detach().pow(2).sum(dim=-1).mean()
@@ -914,6 +915,9 @@ class Dino_f(pl.LightningModule):
             ),
             "Train/pred_batch_std": x_gen.detach().reshape(B, -1).std(dim=0, unbiased=False).mean(),
         }
+        if drift_diag is not None:
+            for k, v in drift_diag.items():
+                metrics[f"Train/drift_{k}"] = v.detach() if torch.is_tensor(v) else v
         if self.drift_diversity_weight > 0.0 and div_cos is not None:
             metrics["Train/div_reg_cos"] = div_cos.detach()
         if drift_temp_dist is not None:
