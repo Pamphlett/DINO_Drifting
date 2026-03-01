@@ -32,6 +32,20 @@ def _mean_pairwise_l2(samples: torch.Tensor) -> torch.Tensor:
     return distances.mean()
 
 
+def _mean_pairwise_l2_batched(samples: torch.Tensor) -> torch.Tensor:
+    if samples.dim() != 3:
+        raise ValueError("samples must have shape [L, N, D].")
+    _, n, _ = samples.shape
+    if n < 2:
+        return samples.new_ones(samples.shape[0])
+    distances = torch.cdist(samples, samples, p=2)
+    tri_mask = torch.triu(torch.ones(n, n, device=samples.device, dtype=torch.bool), diagonal=1)
+    pairwise = distances[:, tri_mask]
+    if pairwise.numel() == 0:
+        return samples.new_ones(samples.shape[0])
+    return pairwise.mean(dim=-1)
+
+
 @torch.no_grad()
 def compute_V(
     x: torch.Tensor,
@@ -104,3 +118,67 @@ def compute_V(
         v_total = v_total + (v_tau / lambda_tau)
 
     return torch.nan_to_num(v_total * scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+@torch.no_grad()
+def compute_V_batched(
+    x: torch.Tensor,
+    y_pos: torch.Tensor,
+    y_neg: torch.Tensor,
+    temperatures: Iterable[float] = (0.02, 0.05, 0.2),
+) -> torch.Tensor:
+    if x.dim() != 3 or y_pos.dim() != 3 or y_neg.dim() != 3:
+        raise ValueError("x, y_pos, y_neg must have shape [L, B, C], [L, B, C], [L, B_neg, C].")
+    if x.shape[0] != y_pos.shape[0] or x.shape[0] != y_neg.shape[0]:
+        raise ValueError("x, y_pos, y_neg must have the same location dimension.")
+    if x.shape[2] != y_pos.shape[2] or x.shape[2] != y_neg.shape[2]:
+        raise ValueError("x, y_pos, y_neg must have the same feature dimension.")
+    if x.shape[1] != y_pos.shape[1]:
+        raise ValueError("x and y_pos must have the same number of samples per location.")
+    if not temperatures:
+        raise ValueError("temperatures must be non-empty.")
+
+    x = x.float()
+    y_pos = y_pos.float()
+    y_neg = y_neg.float()
+
+    _, b, c = x.shape
+    b_neg = y_neg.shape[1]
+    sqrt_c = math.sqrt(c)
+    v_total = torch.zeros_like(x)
+
+    all_samples = torch.cat([x, y_pos, y_neg], dim=1)
+    scale = (_mean_pairwise_l2_batched(all_samples) / sqrt_c).detach().clamp(min=1e-8)
+    x_norm = x / scale[:, None, None]
+    y_pos_norm = y_pos / scale[:, None, None]
+    y_neg_norm = y_neg / scale[:, None, None]
+
+    for temperature in temperatures:
+        t_eff = float(temperature) * sqrt_c
+        dist_pos = torch.cdist(x_norm, y_pos_norm, p=2)
+        dist_neg = torch.cdist(x_norm, y_neg_norm, p=2)
+
+        if b == b_neg and x.data_ptr() == y_neg.data_ptr():
+            dist_neg = dist_neg + torch.eye(b, device=dist_neg.device, dtype=dist_neg.dtype)[None, :, :] * 1e6
+
+        logits = torch.cat([-dist_pos / t_eff, -dist_neg / t_eff], dim=-1)
+        a_row = torch.softmax(logits, dim=-1)
+        a_col = torch.softmax(logits, dim=-2)
+        a_row = torch.nan_to_num(a_row, nan=0.0, posinf=0.0, neginf=0.0)
+        a_col = torch.nan_to_num(a_col, nan=0.0, posinf=0.0, neginf=0.0)
+        a = torch.sqrt(a_row * a_col)
+        a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+        a_pos = a[:, :, :b]
+        a_neg = a[:, :, b:]
+        w_pos = a_pos * a_neg.sum(dim=-1, keepdim=True)
+        w_neg = a_neg * a_pos.sum(dim=-1, keepdim=True)
+
+        drift_pos = w_pos @ y_pos_norm
+        drift_neg = w_neg @ y_neg_norm
+        v_tau = drift_pos - drift_neg
+
+        lambda_tau = torch.sqrt(torch.mean(v_tau.pow(2).sum(dim=-1) / c)).detach().clamp(min=1e-8)
+        v_total = v_total + (v_tau / lambda_tau)
+
+    return torch.nan_to_num(v_total * scale[:, None, None], nan=0.0, posinf=0.0, neginf=0.0)

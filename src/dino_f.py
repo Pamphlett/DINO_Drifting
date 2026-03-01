@@ -21,7 +21,7 @@ from dpt import DPTHead
 import timm
 import time as time_mod
 import shutil
-from src.drifting_utils import compute_V, build_token_sample_ids
+from src.drifting_utils import compute_V, compute_V_batched
 
 def update_depth_metrics(pred, gt, d1_m, d2_m, d3_m, abs_rel_m, rmse_m, log_10_m, rmse_log_m, silog_m, sq_rel_m):
     valid_pixels = gt > 0
@@ -806,6 +806,7 @@ class Dino_f(pl.LightningModule):
         Drifting training step following Algorithm 1 of Deng et al. (2026).
         """
         B, _, H, W, C = x.shape
+        n_tok = H * W
         z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
         cond = self.style_embedder(z)
         final_tokens = self._build_drift_input_tokens(x)
@@ -818,44 +819,48 @@ class Dino_f(pl.LightningModule):
 
         x_gen = x_pred[:, -1]
         y_pos = x[:, -1]
-        n_tok = H * W
-        x_tokens = x_gen.reshape(B * n_tok, C)
-        y_pos_tokens = y_pos.reshape(B * n_tok, C)
-        sample_ids = build_token_sample_ids(B, n_tok, x_tokens.device)
-        token_subset_idx = None
+
+        # Per-location pools: [L, B, C], where L = H * W.
+        x_loc = x_gen.reshape(B, n_tok, C).permute(1, 0, 2).contiguous()
+        y_pos_loc = y_pos.reshape(B, n_tok, C).permute(1, 0, 2).contiguous()
+
+        loc_subset_idx = None
         div_cos = None
-        if self.drift_train_token_cap > 0 and x_tokens.shape[0] > self.drift_train_token_cap:
-            token_subset_idx = torch.randperm(x_tokens.shape[0], device=x_tokens.device)[: self.drift_train_token_cap]
-            x_tokens = x_tokens[token_subset_idx]
-            y_pos_tokens = y_pos_tokens[token_subset_idx]
-            sample_ids = sample_ids[token_subset_idx]
+        if self.drift_train_token_cap > 0 and x_loc.shape[0] * B > self.drift_train_token_cap:
+            loc_cap = max(1, self.drift_train_token_cap // max(B, 1))
+            if loc_cap < x_loc.shape[0]:
+                loc_subset_idx = torch.randperm(x_loc.shape[0], device=x_loc.device)[:loc_cap]
+                x_loc = x_loc[loc_subset_idx]
+                y_pos_loc = y_pos_loc[loc_subset_idx]
 
         # Drift kernels are numerically sensitive in mixed precision; force fp32 math.
         with torch.autocast(device_type=x.device.type, enabled=False):
-            x_tokens_fp32 = torch.nan_to_num(x_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            y_pos_tokens_fp32 = torch.nan_to_num(y_pos_tokens.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            y_neg_tokens_fp32 = x_tokens_fp32
+            x_loc_fp32 = torch.nan_to_num(x_loc.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            y_pos_loc_fp32 = torch.nan_to_num(y_pos_loc.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            l_eff = x_loc_fp32.shape[0]
 
-            y_neg_sample_ids = sample_ids
             if self.drift_all_gather_neg and self._is_dist_ready():
-                sample_ids_for_neg = sample_ids + (int(dist.get_rank()) << 32)
-                y_neg_tokens_fp32 = self._all_gather_variable_first_dim(x_tokens_fp32.detach())
-                y_neg_sample_ids = self._all_gather_variable_first_dim(sample_ids_for_neg)
+                gathered_loc = self._all_gather_variable_first_dim(x_loc_fp32.detach())
+                if gathered_loc.shape[0] % l_eff == 0:
+                    world_chunks = gathered_loc.shape[0] // l_eff
+                    y_neg_loc_fp32 = gathered_loc.reshape(world_chunks, l_eff, B, C).permute(1, 0, 2, 3).reshape(l_eff, world_chunks * B, C)
+                else:
+                    y_neg_loc_fp32 = x_loc_fp32
+            else:
+                y_neg_loc_fp32 = x_loc_fp32
 
-            if self._is_dist_ready():
-                sample_ids = sample_ids + (int(dist.get_rank()) << 32)
+            x_tokens_fp32 = x_loc_fp32.reshape(-1, C)
+            y_pos_tokens_fp32 = y_pos_loc_fp32.reshape(-1, C)
+            y_neg_tokens_fp32 = y_neg_loc_fp32.reshape(-1, C)
 
             drift_temperatures, drift_temp_scale, drift_temp_dist = self._resolve_drift_temperatures(
                 x_tokens_fp32, y_pos_tokens_fp32
             )
-            V = compute_V(
-                x=x_tokens_fp32,
-                y_pos=y_pos_tokens_fp32,
-                y_neg=y_neg_tokens_fp32,
+            V = compute_V_batched(
+                x=x_loc_fp32,
+                y_pos=y_pos_loc_fp32,
+                y_neg=y_neg_loc_fp32,
                 temperatures=drift_temperatures,
-                x_sample_ids=None,
-                y_pos_sample_ids=None,
-                y_neg_sample_ids=None,
             )
             V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
             v_sq_norm_raw = V.detach().pow(2).sum(dim=-1).mean()
@@ -864,8 +869,10 @@ class Dino_f(pl.LightningModule):
                 clip_scale = (self.drift_v_clip / v_norm).clamp(max=1.0)
                 V = V * clip_scale
 
-            x_drifted = (x_tokens_fp32 + V).detach()
-            loss = F.mse_loss(x_tokens_fp32, x_drifted)
+            x_flat = x_loc_fp32.reshape(-1, C)
+            v_flat = V.reshape(-1, C)
+            x_drifted = (x_flat + v_flat).detach()
+            loss = F.mse_loss(x_flat, x_drifted)
 
             # ---- Diversity regularization ----
             if self.drift_diversity_weight > 0.0:
@@ -889,11 +896,11 @@ class Dino_f(pl.LightningModule):
                 if self.global_rank == 0:
                     print(
                         "[DriftDebug] non-finite loss detected: "
-                        f"x_absmax={x_tokens_fp32.abs().max().item():.4e} "
+                        f"x_absmax={x_flat.abs().max().item():.4e} "
                         f"y_absmax={y_pos_tokens_fp32.abs().max().item():.4e} "
                         f"v_absmax={V.abs().max().item():.4e}"
                     )
-                loss = x_tokens_fp32.sum() * 0.0
+                loss = x_flat.sum() * 0.0
 
         metrics = {
             "Train/l_drift": loss.detach(),
@@ -928,15 +935,15 @@ class Dino_f(pl.LightningModule):
                         text_mask=text_mask,
                         cond=cond_alt,
                     )
-                    alt_tokens = torch.nan_to_num(
-                        pred_alt[:, -1].reshape(B * n_tok, -1).float(),
+                    alt_loc_tokens = torch.nan_to_num(
+                        pred_alt[:, -1].reshape(B, n_tok, -1).permute(1, 0, 2).contiguous().float(),
                         nan=0.0,
                         posinf=1e4,
                         neginf=-1e4,
                     )
-                    if token_subset_idx is not None:
-                        alt_tokens = alt_tokens[token_subset_idx]
-                    samples.append(alt_tokens)
+                    if loc_subset_idx is not None:
+                        alt_loc_tokens = alt_loc_tokens[loc_subset_idx]
+                    samples.append(alt_loc_tokens.reshape(-1, alt_loc_tokens.shape[-1]))
 
                 if len(samples) >= 2:
                     diversity_cos = F.cosine_similarity(samples[0], samples[1], dim=-1).mean()
@@ -949,9 +956,9 @@ class Dino_f(pl.LightningModule):
                 if pairwise_cos:
                     metrics["Train/diversity_pairwise_cos"] = torch.stack(pairwise_cos).mean()
 
-                if self.global_step % self.drift_antisymmetry_interval == 0 and x_tokens.shape[0] >= 2:
-                    token_cap = min(self.drift_metric_token_cap, x_tokens.shape[0])
-                    idx = torch.randperm(x_tokens.shape[0], device=x.device)[:token_cap]
+                if self.global_step % self.drift_antisymmetry_interval == 0 and x_tokens_fp32.shape[0] >= 2:
+                    token_cap = min(self.drift_metric_token_cap, x_tokens_fp32.shape[0])
+                    idx = torch.randperm(x_tokens_fp32.shape[0], device=x.device)[:token_cap]
                     x_ref = x_tokens_fp32.detach()[idx]
                     y_pos_ref = y_pos_tokens_fp32.detach()[idx]
                     y_neg_ref = x_tokens_fp32.detach()[idx[torch.randperm(token_cap, device=x.device)]]
@@ -978,7 +985,7 @@ class Dino_f(pl.LightningModule):
                     metrics["Train/drift_antisymmetry_ratio"] = anti_num / anti_den
 
         return loss, metrics
-    
+
     def calculate_loss(self, x_pred, x_target):
         if self.args.loss_type == "MSE":
             loss = F.mse_loss(x_pred, x_target)
