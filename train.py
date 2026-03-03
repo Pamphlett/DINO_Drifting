@@ -173,6 +173,13 @@ def main():
                         help='Weight for diversity regularization loss.')
     parser.add_argument('--drift_noise_dim', type=int, default=256,
                         help='Dimension of random style noise z for drifting conditioning.')
+    parser.add_argument('--use_residual_drifting', action='store_true', default=False)
+    parser.add_argument('--residual_queue_capacity', type=int, default=2048,
+                        help='Capacity of FIFO queue storing image-level GT residuals.')
+    parser.add_argument('--residual_drift_weight', type=float, default=1.0,
+                        help='Weight for residual drifting loss relative to regression loss.')
+    parser.add_argument('--residual_drift_temperatures', type=parse_float_list, default=[0.02, 0.05],
+                        help='Temperatures for residual drifting kernel (image-level).')
     parser.add_argument('--attn_dropout', type=float, default=0.3)
     parser.add_argument('--step', type=int, default=2)
     parser.add_argument('--masking', type=str, default='half_half', choices=['half_half', 'simple_replace', 'half_half_previous'])

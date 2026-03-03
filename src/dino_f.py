@@ -21,7 +21,7 @@ from dpt import DPTHead
 import timm
 import time as time_mod
 import shutil
-from src.drifting_utils import compute_V, compute_V_batched
+from src.drifting_utils import ResidualQueue, compute_V, compute_V_batched
 
 def update_depth_metrics(pred, gt, d1_m, d2_m, d3_m, abs_rel_m, rmse_m, log_10_m, rmse_log_m, silog_m, sq_rel_m):
     valid_pixels = gt > 0
@@ -170,6 +170,7 @@ class Dino_f(pl.LightningModule):
                                        heads=self.heads, mlp_dim=4*self.hidden_dim, dropout=self.dropout,use_fc_bias=args.use_fc_bias,
                                        seperable_attention=args.seperable_attention,seperable_window_size=args.seperable_window_size, use_first_last=args.use_first_last)
         self.use_drifting_loss = getattr(args, "use_drifting_loss", False)
+        self.use_residual_drifting = getattr(args, "use_residual_drifting", False)
         self.drift_temperatures = tuple(getattr(args, "drift_temperatures", [0.02, 0.05, 0.2]))
         self.drift_log_interval = max(1, int(getattr(args, "drift_log_interval", 20)))
         self.drift_antisymmetry_interval = max(1, int(getattr(args, "drift_antisymmetry_interval", 200)))
@@ -189,6 +190,12 @@ class Dino_f(pl.LightningModule):
         if self._drift_temp_ref_dist <= 0.0:
             self._drift_temp_ref_dist = None
         self._drift_temp_scale_ema = 1.0
+        self.residual_queue_capacity = max(1, int(getattr(args, "residual_queue_capacity", 2048)))
+        self.residual_drift_weight = float(getattr(args, "residual_drift_weight", 1.0))
+        self.residual_drift_temperatures = tuple(getattr(args, "residual_drift_temperatures", [0.02, 0.05]))
+        if len(self.residual_drift_temperatures) == 0:
+            self.residual_drift_temperatures = (0.02, 0.05)
+        self.residual_queue = None
         self.use_language_condition = args.use_language_condition
         self.use_precomputed_text = getattr(args, "use_precomputed_text", False)
         if self.use_language_condition:
@@ -227,7 +234,9 @@ class Dino_f(pl.LightningModule):
             torch.nn.init.normal_(self.replace_vector, std=.02)
             self.maskvit.fc_in = nn.Identity()
         self.drift_noise_dim = int(getattr(args, "drift_noise_dim", 256))
-        if self.use_drifting_loss:
+        if self.use_residual_drifting:
+            self.residual_queue = ResidualQueue(self.residual_queue_capacity, self.embedding_dim)
+        if self.use_drifting_loss or self.use_residual_drifting:
             self.style_embedder = StyleEmbedder(self.drift_noise_dim, self.hidden_dim)
         self.activation = nn.Sigmoid() if args.output_activation == "sigmoid" else nn.Identity()
         # Necessary for evaluation
@@ -801,6 +810,12 @@ class Dino_f(pl.LightningModule):
         final_tokens, _ = self.get_mask_tokens(x, mode="full_mask", mask_frames=1)
         return final_tokens
 
+    def _ensure_residual_queue_device(self, device):
+        if self.residual_queue is None:
+            return
+        if self.residual_queue.device != device:
+            self.residual_queue.to(device)
+
     def _drift_training_step(self, x, text_tokens=None, text_mask=None):
         """
         Drifting training step following Algorithm 1 of Deng et al. (2026).
@@ -974,6 +989,101 @@ class Dino_f(pl.LightningModule):
 
         return loss, metrics
 
+    def _residual_drift_training_step(self, x, text_tokens=None, text_mask=None):
+        B, _, H, W, C = x.shape
+        y_gt = x[:, -1]
+
+        final_tokens = self._build_drift_input_tokens(x)
+
+        with torch.no_grad():
+            x_det_pred, _ = self._predict_sequence(
+                final_tokens,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                cond=None,
+            )
+        x_det = x_det_pred[:, -1].detach()
+
+        z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
+        cond = self.style_embedder(z)
+        x_gen_pred, _ = self._predict_sequence(
+            final_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            cond=cond,
+        )
+        x_gen = x_gen_pred[:, -1]
+
+        residual_gt = (y_gt - x_det).reshape(B, -1, C).mean(dim=1)
+        residual_gen = (x_gen - x_det).reshape(B, -1, C).mean(dim=1)
+
+        self._ensure_residual_queue_device(x.device)
+        self.residual_queue.push(residual_gt.detach().float())
+        queue_size = self.residual_queue.size
+
+        loss_reg = F.mse_loss(x_gen, y_gt)
+        loss_drift = loss_reg.new_tensor(0.0)
+        V = torch.zeros(B, C, device=x.device, dtype=torch.float32)
+
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            res_gen_fp32 = residual_gen.float()
+            if queue_size >= 10:
+                pos_pool = self.residual_queue.get_all()
+                neg_pool = res_gen_fp32.detach()
+                V = compute_V(
+                    x=res_gen_fp32,
+                    y_pos=pos_pool,
+                    y_neg=neg_pool,
+                    temperatures=self.residual_drift_temperatures,
+                )
+                V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
+                if self.drift_v_clip > 0.0:
+                    v_norm = V.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    clip_scale = (self.drift_v_clip / v_norm).clamp(max=1.0)
+                    V = V * clip_scale
+
+                x_drifted = (res_gen_fp32 + V).detach()
+                loss_drift = F.mse_loss(res_gen_fp32, x_drifted)
+
+        loss = loss_reg + self.residual_drift_weight * loss_drift
+
+        metrics = {
+            "Train/l_reg": loss_reg.detach(),
+            "Train/l_drift_residual": loss_drift.detach(),
+            "Train/loss": loss.detach(),
+            "Train/queue_size": residual_gen.new_tensor(float(queue_size)),
+            "Train/drift_v_sq_norm": V.detach().pow(2).sum(dim=-1).mean(),
+            "Train/residual_gt_norm": residual_gt.detach().norm(dim=-1).mean(),
+            "Train/residual_gen_norm": residual_gen.detach().norm(dim=-1).mean(),
+            "Train/cos_gen_to_gt": F.cosine_similarity(
+                x_gen.reshape(B, -1).detach(),
+                y_gt.reshape(B, -1).detach(),
+                dim=-1,
+            ).mean(),
+        }
+
+        if self.drift_diversity_weight > 0.0:
+            z2 = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
+            cond2 = self.style_embedder(z2)
+            with torch.no_grad():
+                x_pred2, _ = self._predict_sequence(
+                    final_tokens,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    cond=cond2,
+                )
+            x_gen2 = x_pred2[:, -1]
+            div_cos = F.cosine_similarity(
+                x_gen.reshape(B, -1).float(),
+                x_gen2.reshape(B, -1).float(),
+                dim=-1,
+            ).mean()
+            loss = loss + self.drift_diversity_weight * div_cos
+            metrics["Train/div_reg_cos"] = div_cos.detach()
+
+        metrics["Train/loss"] = loss.detach()
+        return loss, metrics
+
     def calculate_loss(self, x_pred, x_target):
         if self.args.loss_type == "MSE":
             loss = F.mse_loss(x_pred, x_target)
@@ -994,7 +1104,7 @@ class Dino_f(pl.LightningModule):
         with torch.no_grad():
             x = self.preprocess(x)
             B, SL, H, W, C = x.shape
-            if self.use_drifting_loss:
+            if self.use_drifting_loss or self.use_residual_drifting:
                 if self.args.sliding_window_inference:
                     window_size = (16,32)
                     stride = (16,32)
@@ -1069,7 +1179,7 @@ class Dino_f(pl.LightningModule):
             x = self.preprocess(x)
         B, SL, H, W, C = x.shape
         for i in range(unroll_steps):
-            if self.use_drifting_loss:
+            if self.use_drifting_loss or self.use_residual_drifting:
                 with torch.no_grad():
                     if not self.args.sliding_window_inference:
                         z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
@@ -1183,7 +1293,24 @@ class Dino_f(pl.LightningModule):
         # Mask the encoded tokens
         if self.args.crop_feats:
             x = self.crop_feats(x)
-        if self.use_drifting_loss:
+        if self.use_residual_drifting:
+            loss, drift_metrics = self._residual_drift_training_step(
+                x,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+            )
+            for k, v in drift_metrics.items():
+                self.log(
+                    k,
+                    v,
+                    batch_size=B,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=(k in {"Train/l_reg", "Train/l_drift_residual", "Train/drift_v_sq_norm"}),
+                    rank_zero_only=True,
+                )
+        elif self.use_drifting_loss:
             loss, drift_metrics = self._drift_training_step(
                 x,
                 text_tokens=text_tokens,

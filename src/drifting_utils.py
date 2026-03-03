@@ -5,6 +5,86 @@ import torch
 import torch.nn.functional as F
 
 
+class ResidualQueue:
+    """FIFO queue storing image-level GT residual vectors."""
+
+    def __init__(self, capacity: int, feat_dim: int):
+        capacity = int(capacity)
+        feat_dim = int(feat_dim)
+        if capacity <= 0:
+            raise ValueError("capacity must be positive.")
+        if feat_dim <= 0:
+            raise ValueError("feat_dim must be positive.")
+
+        self.capacity = capacity
+        self.feat_dim = feat_dim
+        self._buffer = torch.zeros(capacity, feat_dim, dtype=torch.float32)
+        self._write_ptr = torch.zeros((), dtype=torch.long)
+        self._size = torch.zeros((), dtype=torch.long)
+
+    @property
+    def device(self) -> torch.device:
+        return self._buffer.device
+
+    @property
+    def size(self) -> int:
+        return int(self._size.item())
+
+    def to(self, device: torch.device) -> "ResidualQueue":
+        self._buffer = self._buffer.to(device=device, dtype=torch.float32)
+        self._write_ptr = self._write_ptr.to(device=device)
+        self._size = self._size.to(device=device)
+        return self
+
+    @torch.no_grad()
+    def push(self, residuals: torch.Tensor):
+        """Push [B, D] residuals. Oldest entries are evicted when full."""
+        if residuals.dim() != 2:
+            raise ValueError("residuals must have shape [B, D].")
+        if residuals.shape[1] != self.feat_dim:
+            raise ValueError(f"residual feature dim mismatch: expected {self.feat_dim}, got {residuals.shape[1]}.")
+        if residuals.numel() == 0:
+            return
+
+        residuals = residuals.detach().to(device=self._buffer.device, dtype=torch.float32)
+        n = residuals.shape[0]
+        cap = self.capacity
+
+        if n >= cap:
+            self._buffer.copy_(residuals[-cap:])
+            self._write_ptr.zero_()
+            self._size.fill_(cap)
+            return
+
+        ptr = int(self._write_ptr.item())
+        end = ptr + n
+        if end <= cap:
+            self._buffer[ptr:end].copy_(residuals)
+        else:
+            first = cap - ptr
+            self._buffer[ptr:].copy_(residuals[:first])
+            self._buffer[: end - cap].copy_(residuals[first:])
+
+        self._write_ptr.fill_(end % cap)
+        new_size = min(cap, self.size + n)
+        self._size.fill_(new_size)
+
+    @torch.no_grad()
+    def get_all(self) -> torch.Tensor:
+        """Return [current_size, D] tensor of all stored residuals."""
+        cur_size = self.size
+        if cur_size == 0:
+            return self._buffer[:0]
+        if cur_size < self.capacity:
+            return self._buffer[:cur_size]
+
+        ptr = int(self._write_ptr.item())
+        if ptr == 0:
+            return self._buffer
+        return torch.cat([self._buffer[ptr:], self._buffer[:ptr]], dim=0)
+
+
+
 def build_token_sample_ids(batch_size: int, tokens_per_sample: int, device: torch.device) -> torch.Tensor:
     if batch_size <= 0 or tokens_per_sample <= 0:
         raise ValueError("batch_size and tokens_per_sample must be positive.")
