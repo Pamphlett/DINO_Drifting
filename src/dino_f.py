@@ -1050,7 +1050,6 @@ class Dino_f(pl.LightningModule):
         metrics = {
             "Train/l_reg": loss_reg.detach(),
             "Train/l_drift_residual": loss_drift.detach(),
-            "Train/loss": loss.detach(),
             "Train/queue_size": residual_gen.new_tensor(float(queue_size)),
             "Train/drift_v_sq_norm": V.detach().pow(2).sum(dim=-1).mean(),
             "Train/residual_gt_norm": residual_gt.detach().norm(dim=-1).mean(),
@@ -1081,7 +1080,6 @@ class Dino_f(pl.LightningModule):
             loss = loss + self.drift_diversity_weight * div_cos
             metrics["Train/div_reg_cos"] = div_cos.detach()
 
-        metrics["Train/loss"] = loss.detach()
         return loss, metrics
 
     def calculate_loss(self, x_pred, x_target):
