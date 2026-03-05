@@ -195,6 +195,9 @@ class Dino_f(pl.LightningModule):
         self.residual_drift_temperatures = tuple(getattr(args, "residual_drift_temperatures", [0.02, 0.05]))
         if len(self.residual_drift_temperatures) == 0:
             self.residual_drift_temperatures = (0.02, 0.05)
+        self.context_mask_ratio = max(0.0, float(getattr(args, "context_mask_ratio", 0.0)))
+        self.context_mask_schedule = getattr(args, "context_mask_schedule", "constant")
+        self.context_mask_ratio_min = max(0.0, float(getattr(args, "context_mask_ratio_min", 0.15)))
         self.residual_queue = None
         self.use_language_condition = args.use_language_condition
         self.use_precomputed_text = getattr(args, "use_precomputed_text", False)
@@ -744,6 +747,25 @@ class Dino_f(pl.LightningModule):
         return temperatures, temp_scale, measured_dist
 
 
+    def _current_context_mask_ratio(self) -> float:
+        base = self.context_mask_ratio
+        if base <= 0.0:
+            return 0.0
+        if self.context_mask_schedule == "constant":
+            return base
+        if self.context_mask_schedule == "cosine_anneal":
+            trainer = getattr(self, "trainer", None)
+            total_steps = 0
+            if trainer is not None:
+                total_steps = int(getattr(trainer, "estimated_stepping_batches", 0) or 0)
+            if total_steps <= 0:
+                total_steps = int(getattr(self.args, "max_steps", 0) or 0)
+            progress = self.global_step / float(max(1, total_steps))
+            progress = min(max(progress, 0.0), 1.0)
+            min_ratio = max(0.0, min(self.context_mask_ratio_min, base))
+            return min_ratio + 0.5 * (base - min_ratio) * (1.0 + math.cos(math.pi * progress))
+        return base
+
     def preprocess(self, x):
         B, T, C, H, W = x.shape
         # DINOv2 accepts 4 dimensions [B,C,H,W]. 
@@ -995,6 +1017,19 @@ class Dino_f(pl.LightningModule):
 
         final_tokens = self._build_drift_input_tokens(x)
 
+        effective_mask_ratio = 0.0
+        if self.training:
+            effective_mask_ratio = self._current_context_mask_ratio()
+            if effective_mask_ratio > 0.0:
+                _, T_ctx, H_ctx, W_ctx, _ = final_tokens.shape
+                if T_ctx > 1:
+                    ctx_keep = (
+                        torch.rand(B, T_ctx - 1, H_ctx, W_ctx, 1, device=final_tokens.device)
+                        > effective_mask_ratio
+                    ).to(final_tokens.dtype)
+                    final_tokens = final_tokens.clone()
+                    final_tokens[:, :T_ctx - 1] = final_tokens[:, :T_ctx - 1] * ctx_keep
+
         with torch.no_grad():
             x_det_pred, _ = self._predict_sequence(
                 final_tokens,
@@ -1050,6 +1085,7 @@ class Dino_f(pl.LightningModule):
         metrics = {
             "Train/l_reg": loss_reg.detach(),
             "Train/l_drift_residual": loss_drift.detach(),
+            "Train/context_mask_ratio": residual_gen.new_tensor(float(effective_mask_ratio)),
             "Train/queue_size": residual_gen.new_tensor(float(queue_size)),
             "Train/drift_v_sq_norm": V.detach().pow(2).sum(dim=-1).mean(),
             "Train/residual_gt_norm": residual_gt.detach().norm(dim=-1).mean(),
@@ -1305,7 +1341,7 @@ class Dino_f(pl.LightningModule):
                     logger=True,
                     on_step=True,
                     on_epoch=False,
-                    prog_bar=(k in {"Train/l_reg", "Train/l_drift_residual", "Train/drift_v_sq_norm"}),
+                    prog_bar=(k in {"Train/l_reg", "Train/div_reg_cos", "Train/cos_gen_to_gt", "Train/drift_v_sq_norm"}),
                     rank_zero_only=True,
                 )
         elif self.use_drifting_loss:

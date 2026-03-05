@@ -180,6 +180,13 @@ def main():
                         help='Weight for residual drifting loss relative to regression loss.')
     parser.add_argument('--residual_drift_temperatures', type=parse_float_list, default=[0.02, 0.05],
                         help='Temperatures for residual drifting kernel (image-level).')
+    parser.add_argument('--context_mask_ratio', type=float, default=0.0,
+                        help='Fraction of context-frame tokens to drop during residual drifting training.')
+    parser.add_argument('--context_mask_schedule', type=str, default='constant',
+                        choices=['constant', 'cosine_anneal'],
+                        help='Schedule for context token masking ratio during training.')
+    parser.add_argument('--context_mask_ratio_min', type=float, default=0.15,
+                        help='Minimum context masking ratio for cosine anneal schedule.')
     parser.add_argument('--attn_dropout', type=float, default=0.3)
     parser.add_argument('--step', type=int, default=2)
     parser.add_argument('--masking', type=str, default='half_half', choices=['half_half', 'simple_replace', 'half_half_previous'])
