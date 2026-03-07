@@ -198,6 +198,16 @@ class Dino_f(pl.LightningModule):
         self.context_mask_ratio = max(0.0, float(getattr(args, "context_mask_ratio", 0.0)))
         self.context_mask_schedule = getattr(args, "context_mask_schedule", "constant")
         self.context_mask_ratio_min = max(0.0, float(getattr(args, "context_mask_ratio_min", 0.15)))
+        self.use_flow_matching = bool(getattr(args, "use_flow_matching", False))
+        self.fm_num_steps = max(1, int(getattr(args, "fm_num_steps", 16)))
+        self.fm_time_embed_dim = max(8, int(getattr(args, "fm_time_embed_dim", 256)))
+        self.fm_loss_weight = float(getattr(args, "fm_loss_weight", 1.0))
+        self.fm_train_on_last_frame_only = bool(getattr(args, "fm_train_on_last_frame_only", True))
+        self.fm_noise_scale = float(getattr(args, "fm_noise_scale", 1.0))
+        self.fm_sampling_clip = max(0.0, float(getattr(args, "fm_sampling_clip", 0.0)))
+        self.fm_use_ema = bool(getattr(args, "fm_use_ema", False))
+        self.fm_predict_residual = bool(getattr(args, "fm_predict_residual", False))
+        self.fm_detach_anchor = bool(getattr(args, "fm_detach_anchor", True))
         self.residual_queue = None
         self.use_language_condition = args.use_language_condition
         self.use_precomputed_text = getattr(args, "use_precomputed_text", False)
@@ -241,6 +251,13 @@ class Dino_f(pl.LightningModule):
             self.residual_queue = ResidualQueue(self.residual_queue_capacity, self.embedding_dim)
         if self.use_drifting_loss or self.use_residual_drifting:
             self.style_embedder = StyleEmbedder(self.drift_noise_dim, self.hidden_dim)
+        self.fm_time_mlp = nn.Sequential(
+            nn.Linear(self.fm_time_embed_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        if self.fm_use_ema:
+            print("[FlowMatching] --fm_use_ema is set, but EMA is not implemented yet; continuing without EMA.")
         self.activation = nn.Sigmoid() if args.output_activation == "sigmoid" else nn.Identity()
         # Necessary for evaluation
         self.mean_metric = MeanMetric()
@@ -828,6 +845,164 @@ class Dino_f(pl.LightningModule):
         x_pred = self.activation(x_pred)
         return x_pred, attn
 
+    def _fm_future_frame_count(self):
+        if self.fm_train_on_last_frame_only:
+            return 1
+        if self.sequence_length == 7:
+            return max(1, min(int(self.train_mask_frames), 3))
+        return 1
+
+    def _build_fm_input_tokens(self, x):
+        B, sl, h, w, _ = x.shape
+        if self.masking in ("half_half", "half_half_previous"):
+            embedded_tokens = self.embed(x)
+            mask_tokens = self.unmask_vector.expand(B, sl, h, w, -1)
+            return torch.cat((embedded_tokens, mask_tokens), dim=-1)
+        return self.embed(x)
+
+    def _sinusoidal_timestep_embedding(self, t, dim):
+        if dim <= 0:
+            return t[:, None]
+        t = t.float()
+        half = dim // 2
+        if half == 0:
+            return t[:, None]
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half, device=t.device, dtype=t.dtype) / max(half - 1, 1)
+        )
+        angles = (2.0 * math.pi) * t[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+    def _flow_time_condition(self, t):
+        time_emb = self._sinusoidal_timestep_embedding(t, self.fm_time_embed_dim)
+        time_emb = time_emb.to(self.fm_time_mlp[0].weight.dtype)
+        return self.fm_time_mlp(time_emb)
+
+    def _predict_deterministic_anchor(self, x, future_frames, text_tokens=None, text_mask=None, detach=True):
+        masked_x, _ = self.get_mask_tokens(x, mode="full_mask", mask_frames=future_frames)
+        if detach:
+            with torch.no_grad():
+                x_det_pred, _ = self._predict_sequence(
+                    masked_x,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    cond=None,
+                )
+            return x_det_pred[:, -future_frames:].detach()
+        x_det_pred, _ = self._predict_sequence(
+            masked_x,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            cond=None,
+        )
+        return x_det_pred[:, -future_frames:]
+
+    def _predict_flow_velocity(self, x_context, x_state, t, future_frames, text_tokens=None, text_mask=None):
+        fm_input = x_context.clone()
+        fm_input[:, -future_frames:] = x_state
+        fm_tokens = self._build_fm_input_tokens(fm_input)
+        cond = self._flow_time_condition(t).to(fm_tokens.dtype)
+        x_pred, _ = self._predict_sequence(
+            fm_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            cond=cond,
+        )
+        return x_pred[:, -future_frames:]
+
+    def _flow_matching_training_step(self, x, text_tokens=None, text_mask=None):
+        B = x.shape[0]
+        future_frames = self._fm_future_frame_count()
+        x_target = x[:, -future_frames:]
+
+        x_anchor = None
+        if self.fm_predict_residual:
+            x_anchor = self._predict_deterministic_anchor(
+                x,
+                future_frames=future_frames,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                detach=self.fm_detach_anchor,
+            )
+            x1 = x_target - x_anchor
+        else:
+            x1 = x_target
+
+        x0 = torch.randn_like(x1) * self.fm_noise_scale
+        t = torch.rand(B, device=x.device, dtype=x.dtype)
+        t_broadcast = t.view(B, *([1] * (x1.ndim - 1)))
+        x_t = (1.0 - t_broadcast) * x0 + t_broadcast * x1
+        v_target = x1 - x0
+
+        v_pred = self._predict_flow_velocity(
+            x,
+            x_state=x_t,
+            t=t,
+            future_frames=future_frames,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
+
+        fm_loss = F.mse_loss(v_pred.float(), v_target.float())
+        loss = self.fm_loss_weight * fm_loss
+
+        metrics = {
+            "train/fm_loss": fm_loss.detach(),
+            "train/fm_t_mean": t.detach().float().mean(),
+            "train/fm_vel_norm": v_pred.detach().float().norm(dim=-1).mean(),
+        }
+        if self.fm_predict_residual and x_anchor is not None:
+            metrics["train/fm_anchor_mse"] = F.mse_loss(x_anchor.float(), x_target.float()).detach()
+            metrics["train/fm_residual_norm"] = x1.detach().float().norm(dim=-1).mean()
+
+        return loss, metrics
+
+    def _sample_future_with_flow_matching(self, x, text_tokens=None, text_mask=None, num_steps=None):
+        B = x.shape[0]
+        future_frames = self._fm_future_frame_count()
+        num_steps = max(1, int(self.fm_num_steps if num_steps is None else num_steps))
+        dt = 1.0 / float(num_steps)
+
+        if self.fm_predict_residual:
+            x_anchor = self._predict_deterministic_anchor(
+                x,
+                future_frames=future_frames,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                detach=True,
+            )
+            x_state = torch.randn_like(x_anchor) * self.fm_noise_scale
+        else:
+            x_anchor = None
+            x_state = torch.randn_like(x[:, -future_frames:]) * self.fm_noise_scale
+
+        for i in range(num_steps):
+            t_i = torch.full(
+                (B,),
+                float(i) / float(num_steps),
+                device=x.device,
+                dtype=x_state.dtype,
+            )
+            v_pred = self._predict_flow_velocity(
+                x,
+                x_state=x_state,
+                t=t_i,
+                future_frames=future_frames,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+            )
+            x_state = x_state + dt * v_pred
+            if self.fm_sampling_clip > 0.0:
+                x_state = x_state.clamp(min=-self.fm_sampling_clip, max=self.fm_sampling_clip)
+
+        x_sample = x_state if x_anchor is None else x_anchor + x_state
+        prediction = x.clone()
+        prediction[:, -future_frames:] = x_sample
+        return prediction
+
     def _build_drift_input_tokens(self, x):
         final_tokens, _ = self.get_mask_tokens(x, mode="full_mask", mask_frames=1)
         return final_tokens
@@ -1138,6 +1313,25 @@ class Dino_f(pl.LightningModule):
         with torch.no_grad():
             x = self.preprocess(x)
             B, SL, H, W, C = x.shape
+            if self.use_flow_matching:
+                if self.args.sliding_window_inference:
+                    window_size = (16,32)
+                    stride = (16,32)
+                    x_wins = self.sliding_window(x, window_size, stride)
+                    wins = []
+                    for i in range(x_wins.shape[0]):
+                        win = x_wins[i]
+                        pred_win = self._sample_future_with_flow_matching(win, num_steps=self.fm_num_steps)
+                        wins.append(pred_win)
+                    prediction = self.merge_windows(torch.stack(wins), (B, SL, H, W, C), window_size, stride).to(x.device)
+                else:
+                    if self.args.crop_feats:
+                        x = self.crop_feats(x)
+                        B, SL, H, W, C = x.shape
+                    prediction = self._sample_future_with_flow_matching(x, num_steps=self.fm_num_steps)
+                prediction = self.postprocess(prediction)
+                loss = torch.tensor(0.0, device=x.device)
+                return prediction, loss
             if self.use_drifting_loss or self.use_residual_drifting:
                 if self.args.sliding_window_inference:
                     window_size = (16,32)
@@ -1212,7 +1406,24 @@ class Dino_f(pl.LightningModule):
         with torch.no_grad():
             x = self.preprocess(x)
         B, SL, H, W, C = x.shape
-        for i in range(unroll_steps):
+        for _ in range(unroll_steps):
+            if self.use_flow_matching:
+                with torch.no_grad():
+                    if not self.args.sliding_window_inference:
+                        final_tokens = self._sample_future_with_flow_matching(x, num_steps=self.fm_num_steps)
+                    else:
+                        window_size = (16,32)
+                        stride = (16,32)
+                        x_s = self.sliding_window(x, window_size, stride)
+                        wins = []
+                        for j in range(x_s.shape[0]):
+                            win = x_s[j]
+                            pred_win = self._sample_future_with_flow_matching(win, num_steps=self.fm_num_steps)
+                            wins.append(pred_win)
+                        final_tokens = self.merge_windows(torch.stack(wins), (B, SL, H, W, C), window_size, stride).to(x.device)
+                x[:,-1] = final_tokens[:,-1]
+                x = torch.cat((x[:,1:], x[:,-1].unsqueeze(1)), dim=1)
+                continue
             if self.use_drifting_loss or self.use_residual_drifting:
                 with torch.no_grad():
                     if not self.args.sliding_window_inference:
@@ -1245,33 +1456,31 @@ class Dino_f(pl.LightningModule):
                 mask = mask.to(x.device)
                 if self.args.single_step_sample_train or step==1:
                     if self.args.vis_attn:
-                        _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
+                        _, final_tokens, _ = self.forward(x, masked_soft_tokens, mask)
                     else:
-                        loss, final_tokens= self.forward(x, masked_soft_tokens, mask)
+                        loss, final_tokens = self.forward(x, masked_soft_tokens, mask)
                 else:
                     assert "Not implemented"
-                # x = self.postprocess(final_tokens)
             else:
                 window_size = (16,32)
                 stride = (16,32)
                 x_s = self.sliding_window(x, window_size, stride)
                 wins = []
-                for i in range(x_s.shape[0]):
-                    win = x_s[i]
+                for j in range(x_s.shape[0]):
+                    win = x_s[j]
                     masked_soft_tokens, mask = self.get_mask_tokens(win, mode="full_mask",mask_frames=mask_frames)
                     mask = mask.to(x.device)
                     if self.args.single_step_sample_train or step==1:
                         if self.args.vis_attn:
-                            _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
+                            _, final_tokens_win, _ = self.forward(win, masked_soft_tokens, mask)
                         else:
                             loss, final_tokens_win = self.forward(win, masked_soft_tokens, mask)
                     wins.append(final_tokens_win)
                 final_tokens = self.merge_windows(torch.stack(wins), (B, SL, H, W, 1152), window_size, stride).to(x.device)
             x[:,-1] = final_tokens[:,-1]
-            x = torch.cat((x[:,1:], x[:,-1].unsqueeze(1)), dim=1) # Mayve also try torch.zeros instead of x[:,-1]
+            x = torch.cat((x[:,1:], x[:,-1].unsqueeze(1)), dim=1)
         prediction = self.postprocess(x)
         loss = self.calculate_loss(prediction[:,-1].flatten(end_dim=-2), gt_feats.flatten(end_dim=-2))
-        # return prediction, loss, x
         return prediction, loss
 
     def forward(self, x, masked_x, mask=None, text_tokens=None, text_mask=None):
@@ -1327,7 +1536,25 @@ class Dino_f(pl.LightningModule):
         # Mask the encoded tokens
         if self.args.crop_feats:
             x = self.crop_feats(x)
-        if self.use_residual_drifting:
+        if self.use_flow_matching:
+            loss, fm_metrics = self._flow_matching_training_step(
+                x,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+            )
+            self._last_fm_loss = fm_metrics.get("train/fm_loss", loss.detach())
+            for k, v in fm_metrics.items():
+                self.log(
+                    k,
+                    v,
+                    batch_size=B,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=(k in {"train/fm_loss", "train/fm_vel_norm"}),
+                    rank_zero_only=True,
+                )
+        elif self.use_residual_drifting:
             loss, drift_metrics = self._residual_drift_training_step(
                 x,
                 text_tokens=text_tokens,
@@ -1392,6 +1619,8 @@ class Dino_f(pl.LightningModule):
         B = batch[0].shape[0]
         loss = self.training_step(batch, batch_idx)
         self.log('val/loss', loss, prog_bar=True, batch_size=B, logger=True, sync_dist=True, on_step=False, on_epoch=True)
+        if self.use_flow_matching and hasattr(self, "_last_fm_loss"):
+            self.log('val/fm_loss', self._last_fm_loss, prog_bar=False, batch_size=B, logger=True, sync_dist=True, on_step=False, on_epoch=True)
 
     def baseline_evaluation_step(self, x, gt_feats):
         B = x.shape[0]

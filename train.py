@@ -32,6 +32,16 @@ def parse_val_check_interval(x):
     except ValueError:
         return float(x)
 
+def parse_bool(x):
+    if isinstance(x, bool):
+        return x
+    x = str(x).strip().lower()
+    if x in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if x in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {x}")
+
 def _log_stage(log_path, message):
     if not log_path:
         return
@@ -187,6 +197,26 @@ def main():
                         help='Schedule for context token masking ratio during training.')
     parser.add_argument('--context_mask_ratio_min', type=float, default=0.15,
                         help='Minimum context masking ratio for cosine anneal schedule.')
+    parser.add_argument('--use_flow_matching', action='store_true', default=False,
+                        help='Enable conditional flow matching training for future latent generation.')
+    parser.add_argument('--fm_num_steps', type=int, default=16,
+                        help='Number of Euler integration steps used for FM sampling.')
+    parser.add_argument('--fm_time_embed_dim', type=int, default=256,
+                        help='Dimension of sinusoidal timestep embedding before projection.')
+    parser.add_argument('--fm_loss_weight', type=float, default=1.0,
+                        help='Weight for flow matching training loss.')
+    parser.add_argument('--fm_train_on_last_frame_only', type=parse_bool, default=True,
+                        help='If True, train FM only on the last future frame latent.')
+    parser.add_argument('--fm_noise_scale', type=float, default=1.0,
+                        help='Std scale for FM starting noise x0.')
+    parser.add_argument('--fm_sampling_clip', type=float, default=0.0,
+                        help='Optional clip value for FM state during Euler sampling (0 disables).')
+    parser.add_argument('--fm_use_ema', action='store_true', default=False,
+                        help='Reserved flag for future FM EMA support.')
+    parser.add_argument('--fm_predict_residual', action='store_true', default=False,
+                        help='Run FM on residuals around deterministic anchor predictions.')
+    parser.add_argument('--fm_detach_anchor', type=parse_bool, default=True,
+                        help='Detach deterministic anchor when fm_predict_residual=True.')
     parser.add_argument('--attn_dropout', type=float, default=0.3)
     parser.add_argument('--step', type=int, default=2)
     parser.add_argument('--masking', type=str, default='half_half', choices=['half_half', 'simple_replace', 'half_half_previous'])
