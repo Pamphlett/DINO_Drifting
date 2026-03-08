@@ -1308,7 +1308,7 @@ class Dino_f(pl.LightningModule):
         x_pred = x_pred[mask] 
         return self.calculate_loss(x_pred, x_target)
         
-    def sample(self, x, sched_mode="arccos", step=15, mask_frames=1):
+    def sample(self, x, sched_mode="arccos", step=15, mask_frames=1, text_tokens=None, text_mask=None):
         self.maskvit.eval()
         with torch.no_grad():
             x = self.preprocess(x)
@@ -1321,14 +1321,24 @@ class Dino_f(pl.LightningModule):
                     wins = []
                     for i in range(x_wins.shape[0]):
                         win = x_wins[i]
-                        pred_win = self._sample_future_with_flow_matching(win, num_steps=self.fm_num_steps)
+                        pred_win = self._sample_future_with_flow_matching(
+                            win,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                            num_steps=self.fm_num_steps,
+                        )
                         wins.append(pred_win)
                     prediction = self.merge_windows(torch.stack(wins), (B, SL, H, W, C), window_size, stride).to(x.device)
                 else:
                     if self.args.crop_feats:
                         x = self.crop_feats(x)
                         B, SL, H, W, C = x.shape
-                    prediction = self._sample_future_with_flow_matching(x, num_steps=self.fm_num_steps)
+                    prediction = self._sample_future_with_flow_matching(
+                        x,
+                        text_tokens=text_tokens,
+                        text_mask=text_mask,
+                        num_steps=self.fm_num_steps,
+                    )
                 prediction = self.postprocess(prediction)
                 loss = torch.tensor(0.0, device=x.device)
                 return prediction, loss
@@ -1343,7 +1353,12 @@ class Dino_f(pl.LightningModule):
                         z = torch.randn(B, self.drift_noise_dim, device=win.device, dtype=win.dtype)
                         cond = self.style_embedder(z)
                         final_tokens = self._build_drift_input_tokens(win)
-                        x_pred, _ = self._predict_sequence(final_tokens, cond=cond)
+                        x_pred, _ = self._predict_sequence(
+                            final_tokens,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                            cond=cond,
+                        )
                         pred_win = win.clone()
                         pred_win[:, -1] = x_pred[:, -1]
                         wins.append(pred_win)
@@ -1355,7 +1370,12 @@ class Dino_f(pl.LightningModule):
                     z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
                     cond = self.style_embedder(z)
                     final_tokens = self._build_drift_input_tokens(x)
-                    x_pred, _ = self._predict_sequence(final_tokens, cond=cond)
+                    x_pred, _ = self._predict_sequence(
+                        final_tokens,
+                        text_tokens=text_tokens,
+                        text_mask=text_mask,
+                        cond=cond,
+                    )
                     prediction = x.clone()
                     prediction[:, -1] = x_pred[:, -1]
                 prediction = self.postprocess(prediction)
@@ -1368,9 +1388,21 @@ class Dino_f(pl.LightningModule):
                 mask = mask.to(x.device)
                 if self.args.single_step_sample_train or step==1:
                     if self.args.vis_attn:
-                        _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
+                        _, final_tokens, attn_weights = self.forward(
+                            x,
+                            masked_soft_tokens,
+                            mask,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                        )
                     else:
-                        loss, final_tokens = self.forward(x, masked_soft_tokens, mask)
+                        loss, final_tokens = self.forward(
+                            x,
+                            masked_soft_tokens,
+                            mask,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                        )
                 else:
                     assert "Not implemented"
                 prediction = self.postprocess(final_tokens)
@@ -1385,9 +1417,21 @@ class Dino_f(pl.LightningModule):
                     mask = mask.to(x.device)
                     if self.args.single_step_sample_train or step==1:
                         if self.args.vis_attn:
-                            _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
+                            _, final_tokens, attn_weights = self.forward(
+                                x,
+                                masked_soft_tokens,
+                                mask,
+                                text_tokens=text_tokens,
+                                text_mask=text_mask,
+                            )
                         else:
-                            loss, final_tokens = self.forward(win, masked_soft_tokens, mask)
+                            loss, final_tokens = self.forward(
+                                win,
+                                masked_soft_tokens,
+                                mask,
+                                text_tokens=text_tokens,
+                                text_mask=text_mask,
+                            )
                     else:
                         # Instantiate scheduler
                         if isinstance(sched_mode, str):  # Standard ones
@@ -1401,7 +1445,7 @@ class Dino_f(pl.LightningModule):
             return prediction, loss
             # return prediction, loss, final_tokens
 
-    def sample_unroll(self, x, gt_feats, sched_mode="arccos", step=15, mask_frames=1, unroll_steps=3, ):
+    def sample_unroll(self, x, gt_feats, sched_mode="arccos", step=15, mask_frames=1, unroll_steps=3, text_tokens=None, text_mask=None):
         self.maskvit.eval()
         with torch.no_grad():
             x = self.preprocess(x)
@@ -1410,7 +1454,12 @@ class Dino_f(pl.LightningModule):
             if self.use_flow_matching:
                 with torch.no_grad():
                     if not self.args.sliding_window_inference:
-                        final_tokens = self._sample_future_with_flow_matching(x, num_steps=self.fm_num_steps)
+                        final_tokens = self._sample_future_with_flow_matching(
+                            x,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                            num_steps=self.fm_num_steps,
+                        )
                     else:
                         window_size = (16,32)
                         stride = (16,32)
@@ -1418,7 +1467,12 @@ class Dino_f(pl.LightningModule):
                         wins = []
                         for j in range(x_s.shape[0]):
                             win = x_s[j]
-                            pred_win = self._sample_future_with_flow_matching(win, num_steps=self.fm_num_steps)
+                            pred_win = self._sample_future_with_flow_matching(
+                                win,
+                                text_tokens=text_tokens,
+                                text_mask=text_mask,
+                                num_steps=self.fm_num_steps,
+                            )
                             wins.append(pred_win)
                         final_tokens = self.merge_windows(torch.stack(wins), (B, SL, H, W, C), window_size, stride).to(x.device)
                 x[:,-1] = final_tokens[:,-1]
@@ -1430,7 +1484,12 @@ class Dino_f(pl.LightningModule):
                         z = torch.randn(B, self.drift_noise_dim, device=x.device, dtype=x.dtype)
                         cond = self.style_embedder(z)
                         final_tokens = self._build_drift_input_tokens(x)
-                        x_pred, _ = self._predict_sequence(final_tokens, cond=cond)
+                        x_pred, _ = self._predict_sequence(
+                            final_tokens,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                            cond=cond,
+                        )
                         final_tokens = x.clone()
                         final_tokens[:, -1] = x_pred[:, -1]
                     else:
@@ -1443,7 +1502,12 @@ class Dino_f(pl.LightningModule):
                             z = torch.randn(B, self.drift_noise_dim, device=win.device, dtype=win.dtype)
                             cond = self.style_embedder(z)
                             drift_tokens = self._build_drift_input_tokens(win)
-                            x_pred_win, _ = self._predict_sequence(drift_tokens, cond=cond)
+                            x_pred_win, _ = self._predict_sequence(
+                                drift_tokens,
+                                text_tokens=text_tokens,
+                                text_mask=text_mask,
+                                cond=cond,
+                            )
                             pred_win = win.clone()
                             pred_win[:, -1] = x_pred_win[:, -1]
                             wins.append(pred_win)
@@ -1456,9 +1520,21 @@ class Dino_f(pl.LightningModule):
                 mask = mask.to(x.device)
                 if self.args.single_step_sample_train or step==1:
                     if self.args.vis_attn:
-                        _, final_tokens, _ = self.forward(x, masked_soft_tokens, mask)
+                        _, final_tokens, _ = self.forward(
+                            x,
+                            masked_soft_tokens,
+                            mask,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                        )
                     else:
-                        loss, final_tokens = self.forward(x, masked_soft_tokens, mask)
+                        loss, final_tokens = self.forward(
+                            x,
+                            masked_soft_tokens,
+                            mask,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                        )
                 else:
                     assert "Not implemented"
             else:
@@ -1472,9 +1548,21 @@ class Dino_f(pl.LightningModule):
                     mask = mask.to(x.device)
                     if self.args.single_step_sample_train or step==1:
                         if self.args.vis_attn:
-                            _, final_tokens_win, _ = self.forward(win, masked_soft_tokens, mask)
+                            _, final_tokens_win, _ = self.forward(
+                                win,
+                                masked_soft_tokens,
+                                mask,
+                                text_tokens=text_tokens,
+                                text_mask=text_mask,
+                            )
                         else:
-                            loss, final_tokens_win = self.forward(win, masked_soft_tokens, mask)
+                            loss, final_tokens_win = self.forward(
+                                win,
+                                masked_soft_tokens,
+                                mask,
+                                text_tokens=text_tokens,
+                                text_mask=text_mask,
+                            )
                     wins.append(final_tokens_win)
                 final_tokens = self.merge_windows(torch.stack(wins), (B, SL, H, W, 1152), window_size, stride).to(x.device)
             x[:,-1] = final_tokens[:,-1]
@@ -1635,6 +1723,8 @@ class Dino_f(pl.LightningModule):
         gt_segm = None
         gt_depth = None
         gt_normals = None
+        text_tokens = None
+        text_mask = None
         if torch.is_tensor(batch):
             data_tensor = batch
             gt_img = data_tensor[:, -1]
@@ -1644,6 +1734,12 @@ class Dino_f(pl.LightningModule):
             if self.args.eval_modality is None:
                 if len(batch) >= 2:
                     data_tensor, gt_img = batch[:2]
+                    for item in batch[2:]:
+                        if torch.is_tensor(item):
+                            if item.ndim == 3:
+                                text_tokens = item
+                            elif item.ndim == 2:
+                                text_mask = item
                 else:
                     data_tensor = batch[0]
                     gt_img = data_tensor[:, -1]
@@ -1670,9 +1766,23 @@ class Dino_f(pl.LightningModule):
             samples, loss = self.baseline_evaluation_step(data_tensor,gt_feats=gt_feats)
         else:
             if self.args.eval_midterm:
-                samples, loss = self.sample_unroll(data_tensor,gt_feats,sched_mode=self.train_mask_mode,step=self.args.step, unroll_steps=3)
+                samples, loss = self.sample_unroll(
+                    data_tensor,
+                    gt_feats,
+                    sched_mode=self.train_mask_mode,
+                    step=self.args.step,
+                    unroll_steps=3,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                )
             else:
-                samples, loss = self.sample(data_tensor,sched_mode=self.train_mask_mode,step=self.args.step)
+                samples, loss = self.sample(
+                    data_tensor,
+                    sched_mode=self.train_mask_mode,
+                    step=self.args.step,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                )
         # Evaluation
         pred_feats = samples[:,-1]
         gt_feats = gt_feats.unsqueeze(1)
