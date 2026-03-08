@@ -9,6 +9,10 @@ LANG_CACHE_TRAIN="${LANG_CACHE_TRAIN:-${OPENDV_LANG_ROOT}/mini_train_cache.json}
 LANG_CACHE_VAL="${LANG_CACHE_VAL:-${OPENDV_LANG_ROOT}/mini_val_cache.json}"
 DEFAULT_LANG_FEAT_NAME="lang_clip_{start}_{end}.pt"
 OPENDV_LANG_FEAT_NAME="${OPENDV_LANG_FEAT_NAME:-$DEFAULT_LANG_FEAT_NAME}"
+BUILD_LANG_CACHE_IF_MISSING="${BUILD_LANG_CACHE_IF_MISSING:-1}"
+TRAIN_CACHE_TARGET_ENTRIES="${TRAIN_CACHE_TARGET_ENTRIES:-200}"
+VAL_CACHE_TARGET_ENTRIES="${VAL_CACHE_TARGET_ENTRIES:-100}"
+LANG_CACHE_SEED="${LANG_CACHE_SEED:-123}"
 
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-5}"
 IMG_SIZE="${IMG_SIZE:-196,392}"
@@ -22,6 +26,27 @@ CUDA_VISIBLE_DEVICES=2
 EXTRA_ARGS=()
 if [[ -n "${MAX_BATCHES}" ]]; then
   EXTRA_ARGS+=(--max_batches "${MAX_BATCHES}")
+fi
+
+if [[ "${BUILD_LANG_CACHE_IF_MISSING}" == "1" || "${BUILD_LANG_CACHE_IF_MISSING,,}" == "true" ]]; then
+  if [[ ! -f "${LANG_CACHE_TRAIN}" ]]; then
+    echo "LANG_CACHE_TRAIN not found, building subset cache: ${LANG_CACHE_TRAIN}"
+    python build_opendv_subset_lang_cache.py \
+      --lang_root "${OPENDV_LANG_ROOT}" \
+      --split train \
+      --output "${LANG_CACHE_TRAIN}" \
+      --target_entries "${TRAIN_CACHE_TARGET_ENTRIES}" \
+      --seed "${LANG_CACHE_SEED}"
+  fi
+  if [[ ! -f "${LANG_CACHE_VAL}" ]]; then
+    echo "LANG_CACHE_VAL not found, building subset cache: ${LANG_CACHE_VAL}"
+    python build_opendv_subset_lang_cache.py \
+      --lang_root "${OPENDV_LANG_ROOT}" \
+      --split val \
+      --output "${LANG_CACHE_VAL}" \
+      --target_entries "${VAL_CACHE_TARGET_ENTRIES}" \
+      --seed "${LANG_CACHE_SEED}"
+  fi
 fi
 
 rm -rf "${OUT_ROOT_BASE}/train" "${OUT_ROOT_BASE}/val"
