@@ -8,6 +8,7 @@ OPENDV_LANG_ROOT="${OPENDV_LANG_ROOT:-/path/to/OpenDV-YouTube-Language}"
 LANG_CACHE_TRAIN="${LANG_CACHE_TRAIN:-${OPENDV_LANG_ROOT}/mini_train_cache.json}"
 LANG_CACHE_VAL="${LANG_CACHE_VAL:-${OPENDV_LANG_ROOT}/mini_val_cache.json}"
 RGB_DECODER_PATH="${RGB_DECODER_PATH:-}"
+RGB_DECODER_TYPE="${RGB_DECODER_TYPE:-auto}"
 EVAL_SUBSET_INDEX_FILE="${EVAL_SUBSET_INDEX_FILE:-${OUTPUT_DIR}/eval_subset_indices.json}"
 
 DATA_SPLIT="${DATA_SPLIT:-val}"
@@ -68,7 +69,7 @@ CMD=(
 )
 
 if [[ -n "${RGB_DECODER_PATH}" ]]; then
-  CMD+=(--rgb_decoder_path "${RGB_DECODER_PATH}")
+  CMD+=(--rgb_decoder_path "${RGB_DECODER_PATH}" --rgb_decoder_type "${RGB_DECODER_TYPE}")
 fi
 
 if [[ -n "${DEVICE}" ]]; then

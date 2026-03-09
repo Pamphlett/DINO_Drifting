@@ -157,6 +157,13 @@ def build_parser(config_defaults: Optional[Dict[str, Any]] = None) -> argparse.A
     )
     parser.add_argument("--eval_sampling_seed", type=int, default=0, help="Base seed for stochastic sampling during quantitative evaluation.")
     parser.add_argument("--rgb_decoder_path", type=str, default=None, help="Optional RGB decoder checkpoint. If unavailable, latent-only evaluation still runs.")
+    parser.add_argument(
+        "--rgb_decoder_type",
+        type=str,
+        default="auto",
+        choices=["auto", "from_feats", "from_dino"],
+        help="Decoder loading path. Use from_feats for FeatureRgbDecoder and from_dino for DinoV2RGBDecoder.",
+    )
     parser.add_argument("--pca_ckpt", type=str, default=None, help="Optional PCA checkpoint override if the predictor checkpoint expects one.")
     parser.add_argument("--head_ckpt", type=str, default=None, help="Optional head checkpoint override for downstream eval modalities.")
     parser.add_argument("--output_dir", type=str, required=True)
@@ -799,36 +806,47 @@ class DecoderWrapper:
         return pred.detach()
 
 
-def load_optional_decoder(decoder_path: Optional[str], device: torch.device) -> Optional[DecoderWrapper]:
+def load_optional_decoder(decoder_path: Optional[str], decoder_type: str, device: torch.device) -> Optional[DecoderWrapper]:
     if not decoder_path:
         return None
 
-    try:
-        from train_rgb_decoder_from_feats import FeatureRgbDecoder
+    if decoder_type in {"auto", "from_feats"}:
+        try:
+            from train_rgb_decoder_from_feats import FeatureRgbDecoder
 
-        decoder = FeatureRgbDecoder.load_from_checkpoint(decoder_path, strict=False, map_location="cpu")
-        decoder.eval().to(device)
-        log(f"Loaded feature RGB decoder: {decoder_path}")
-        return DecoderWrapper(decoder, mode="feature_rgb")
-    except Exception as exc:
-        log(f"FeatureRgbDecoder load failed for {decoder_path}: {exc}")
+            decoder = FeatureRgbDecoder.load_from_checkpoint(decoder_path, strict=False, map_location="cpu")
+            decoder.eval().to(device)
+            log(f"Loaded feature RGB decoder: {decoder_path}")
+            return DecoderWrapper(decoder, mode="feature_rgb")
+        except Exception as exc:
+            if decoder_type == "from_feats":
+                raise ValueError(
+                    f"Failed to load decoder as FeatureRgbDecoder from {decoder_path}: {exc}"
+                ) from exc
+            log(f"FeatureRgbDecoder load failed for {decoder_path}: {exc}")
 
-    try:
-        from train_rgb_decoder import DinoV2RGBDecoder
+    if decoder_type in {"auto", "from_dino"}:
+        try:
+            from train_rgb_decoder import DinoV2RGBDecoder
 
-        decoder = DinoV2RGBDecoder.load_from_checkpoint(
-            decoder_path,
-            strict=False,
-            map_location="cpu",
-            lpips_weight=0,
-        )
-        decoder.eval().to(device)
-        log(f"Loaded DinoV2 RGB decoder: {decoder_path}")
-        return DecoderWrapper(decoder, mode="dinov2_rgb")
-    except Exception as exc:
-        log(f"RGB decoder fallback failed for {decoder_path}: {exc}")
-        log("Continuing with latent-only qualitative outputs.")
-        return None
+            decoder = DinoV2RGBDecoder.load_from_checkpoint(
+                decoder_path,
+                strict=False,
+                map_location="cpu",
+                lpips_weight=0,
+            )
+            decoder.eval().to(device)
+            log(f"Loaded DinoV2 RGB decoder: {decoder_path}")
+            return DecoderWrapper(decoder, mode="dinov2_rgb")
+        except Exception as exc:
+            if decoder_type == "from_dino":
+                raise ValueError(
+                    f"Failed to load decoder as DinoV2RGBDecoder from {decoder_path}: {exc}"
+                ) from exc
+            log(f"DinoV2RGBDecoder load failed for {decoder_path}: {exc}")
+
+    log("Continuing with latent-only qualitative outputs.")
+    return None
 
 
 def resolve_device(device_arg: Optional[str]) -> torch.device:
@@ -1399,7 +1417,7 @@ def main():
     eval_indices = load_or_create_eval_indices(first_dataset, args, output_dir)
     qual_indices = select_qualitative_indices(eval_indices, args.qual_num_samples, args.qual_seed, output_dir)
 
-    decoder = load_optional_decoder(args.rgb_decoder_path, device)
+    decoder = load_optional_decoder(args.rgb_decoder_path, args.rgb_decoder_type, device)
     qual_cache: Dict[int, Dict[str, Any]] = {}
     results = []
     for checkpoint_info in selected_checkpoints:
