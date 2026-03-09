@@ -862,6 +862,8 @@ class Dino_f(pl.LightningModule):
         return 1
 
     def _build_fm_input_tokens(self, x):
+        embed_weight = self.embed.weight
+        x = x.to(device=embed_weight.device, dtype=embed_weight.dtype)
         B, sl, h, w, _ = x.shape
         if self.masking in ("half_half", "half_half_previous"):
             embedded_tokens = self.embed(x)
@@ -886,8 +888,10 @@ class Dino_f(pl.LightningModule):
         return emb
 
     def _flow_time_condition(self, t):
+        mlp_weight = self.fm_time_mlp[0].weight
+        t = t.to(device=mlp_weight.device, dtype=mlp_weight.dtype)
         time_emb = self._sinusoidal_timestep_embedding(t, self.fm_time_embed_dim)
-        time_emb = time_emb.to(self.fm_time_mlp[0].weight.dtype)
+        time_emb = time_emb.to(device=mlp_weight.device, dtype=mlp_weight.dtype)
         return self.fm_time_mlp(time_emb)
 
     def _predict_deterministic_anchor(self, x, future_frames, text_tokens=None, text_mask=None, detach=True):
@@ -910,8 +914,19 @@ class Dino_f(pl.LightningModule):
         return x_det_pred[:, -future_frames:]
 
     def _predict_flow_velocity(self, x_context, x_state, t, future_frames, text_tokens=None, text_mask=None):
+        embed_weight = self.embed.weight
+        device = embed_weight.device
+        dtype = embed_weight.dtype
+        x_context = x_context.to(device=device, dtype=dtype)
+        x_state = x_state.to(device=device, dtype=dtype)
+        t = t.to(device=device, dtype=self.fm_time_mlp[0].weight.dtype)
+        if text_tokens is not None:
+            text_tokens = text_tokens.to(device=device)
+        if text_mask is not None:
+            text_mask = text_mask.to(device=device)
         fm_input = x_context.clone()
         fm_input[:, -future_frames:] = x_state
+        fm_input = fm_input.to(device=device, dtype=dtype)
         fm_tokens = self._build_fm_input_tokens(fm_input)
         cond = self._flow_time_condition(t).to(fm_tokens.dtype)
         x_pred, _ = self._predict_sequence(
@@ -970,6 +985,14 @@ class Dino_f(pl.LightningModule):
         return loss, metrics
 
     def _sample_future_with_flow_matching(self, x, text_tokens=None, text_mask=None, num_steps=None):
+        embed_weight = self.embed.weight
+        device = embed_weight.device
+        dtype = embed_weight.dtype
+        x = x.to(device=device, dtype=dtype)
+        if text_tokens is not None:
+            text_tokens = text_tokens.to(device=device)
+        if text_mask is not None:
+            text_mask = text_mask.to(device=device)
         B = x.shape[0]
         future_frames = self._fm_future_frame_count()
         num_steps = max(1, int(self.fm_num_steps if num_steps is None else num_steps))
@@ -986,14 +1009,14 @@ class Dino_f(pl.LightningModule):
             x_state = torch.randn_like(x_anchor) * self.fm_noise_scale
         else:
             x_anchor = None
-            x_state = torch.randn_like(x[:, -future_frames:]) * self.fm_noise_scale
+            x_state = torch.randn_like(x[:, -future_frames:], device=device, dtype=dtype) * self.fm_noise_scale
 
         for i in range(num_steps):
             t_i = torch.full(
                 (B,),
                 float(i) / float(num_steps),
-                device=x.device,
-                dtype=x_state.dtype,
+                device=device,
+                dtype=self.fm_time_mlp[0].weight.dtype,
             )
             v_pred = self._predict_flow_velocity(
                 x,
