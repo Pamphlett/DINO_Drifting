@@ -952,9 +952,9 @@ def evaluate_checkpoint(
                 gt_feats = model.crop_feats(gt_feats.unsqueeze(1), use_crop_params=True).squeeze(1)
                 ctx_feats = model.crop_feats(ctx_feats.unsqueeze(1), use_crop_params=True).squeeze(1)
 
-            pred_flat = pred_feats.reshape(batch_size, -1, pred_feats.shape[-1]).float()
-            gt_flat = gt_feats.reshape(batch_size, -1, gt_feats.shape[-1]).float()
-            ctx_flat = ctx_feats.reshape(batch_size, -1, ctx_feats.shape[-1]).float()
+            pred_flat = pred_feats.reshape(batch_size, -1, pred_feats.shape[-1]).detach().float().cpu()
+            gt_flat = gt_feats.reshape(batch_size, -1, gt_feats.shape[-1]).detach().float().cpu()
+            ctx_flat = ctx_feats.reshape(batch_size, -1, ctx_feats.shape[-1]).detach().float().cpu()
 
             latent_mse_values.append(float(F.mse_loss(pred_flat, gt_flat).item()))
             latent_cos_values.append(float(F.cosine_similarity(pred_flat, gt_flat, dim=-1).mean().item()))
@@ -964,8 +964,8 @@ def evaluate_checkpoint(
             motion_ratio_values.append(float((pred_motion / gt_motion).mean().item()))
 
             if decoder is not None:
-                pred_rgb = decoder.decode(pred_feats.to(device))
-                gt_rgb = denormalize_images(gt_img, model.args.feature_extractor).to(pred_rgb.device)
+                pred_rgb = decoder.decode(pred_feats.to(device)).detach().float().cpu()
+                gt_rgb = denormalize_images(gt_img, model.args.feature_extractor).detach().float().cpu()
                 rgb_l1 = F.l1_loss(pred_rgb, gt_rgb)
                 rgb_mse = F.mse_loss(pred_rgb, gt_rgb)
                 rgb_psnr = -10.0 * torch.log10(rgb_mse.clamp(min=1e-8))
