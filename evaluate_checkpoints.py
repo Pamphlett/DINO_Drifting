@@ -380,6 +380,26 @@ def candidate_texts_for_dataset_index(dataset, dataset_index: int, text_field: s
     return []
 
 
+def preview_dataset_texts(
+    dataset,
+    text_field: str,
+    max_examples: int = 12,
+) -> List[str]:
+    previews: List[str] = []
+    limit = min(len(dataset), max_examples * 4)
+    for dataset_index in range(limit):
+        texts = candidate_texts_for_dataset_index(dataset, dataset_index, text_field)
+        if not texts:
+            continue
+        preview = " || ".join(texts).strip()
+        if not preview:
+            continue
+        previews.append(preview)
+        if len(previews) >= max_examples:
+            break
+    return previews
+
+
 def parse_cmd_group_specs(group_specs: Optional[Sequence[str]]) -> List[Tuple[str, List[str]]]:
     if not group_specs:
         return []
@@ -443,7 +463,12 @@ def build_group_buckets(dataset, candidate_indices: Sequence[int], args) -> Dict
 
     empty_groups = [name for name, indices in buckets.items() if not indices]
     if empty_groups:
-        raise ValueError(f"No dataset samples matched eval cmd groups: {empty_groups}")
+        preview = preview_dataset_texts(dataset, args.eval_text_field)
+        preview_text = "; ".join(preview) if preview else "no non-empty text found in scanned samples"
+        raise ValueError(
+            f"No dataset samples matched eval cmd groups: {empty_groups}. "
+            f"field={args.eval_text_field}. Example texts: {preview_text}"
+        )
 
     for name, indices in buckets.items():
         log(f"Eval cmd group '{name}': {len(indices)} matched candidates")

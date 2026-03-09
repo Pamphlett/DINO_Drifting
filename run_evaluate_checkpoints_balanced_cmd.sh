@@ -20,10 +20,11 @@ MAX_CKPTS_TO_COMPARE="${MAX_CKPTS_TO_COMPARE:-5}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 DEVICE="${DEVICE:-}"
+EVAL_TEXT_FIELD="${EVAL_TEXT_FIELD:-either}"
 
 # Balanced command groups: keep both straight and turning clips in the eval subset.
-STRAIGHT_GROUP="${STRAIGHT_GROUP:-straight=go straight,straight}"
-TURN_GROUP="${TURN_GROUP:-turn=turn left,turn right,turn,left,right}"
+STRAIGHT_GROUP="${STRAIGHT_GROUP:-straight=go straight,straight,forward,drive straight,keep straight}"
+TURN_GROUP="${TURN_GROUP:-turn=turn left,turn right,turn,left,right,curve,bend}"
 
 if [[ ! -d "${CKPT_DIR}" ]]; then
   echo "Checkpoint directory not found: ${CKPT_DIR}" >&2
@@ -52,7 +53,7 @@ CMD=(
   --opendv_use_lang_annos true
   --opendv_lang_cache_train "${LANG_CACHE_TRAIN}"
   --opendv_lang_cache_val "${LANG_CACHE_VAL}"
-  --eval_text_field cmd
+  --eval_text_field "${EVAL_TEXT_FIELD}"
   --eval_cmd_groups "${STRAIGHT_GROUP}" "${TURN_GROUP}"
   --eval_subset_size "${EVAL_SUBSET_SIZE}"
   --eval_subset_seed "${EVAL_SUBSET_SEED}"
