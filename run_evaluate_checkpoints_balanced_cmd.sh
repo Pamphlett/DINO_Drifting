@@ -23,8 +23,8 @@ DEVICE="${DEVICE:-}"
 EVAL_TEXT_FIELD="${EVAL_TEXT_FIELD:-either}"
 
 # Balanced command groups: keep both straight and turning clips in the eval subset.
-STRAIGHT_GROUP="${STRAIGHT_GROUP:-straight=go straight,straight,forward,drive straight,keep straight}"
-TURN_GROUP="${TURN_GROUP:-turn=turn left,turn right,turn,left,right,curve,bend}"
+STRAIGHT_GROUP="${STRAIGHT_GROUP:-straight=0,1,go straight,pass the intersection,straight,forward,drive straight,keep straight}"
+TURN_GROUP="${TURN_GROUP:-turn=2,3,turn left,turn right,turn,left,right,curve,bend}"
 
 if [[ ! -d "${CKPT_DIR}" ]]; then
   echo "Checkpoint directory not found: ${CKPT_DIR}" >&2

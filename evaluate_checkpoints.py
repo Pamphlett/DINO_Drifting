@@ -20,6 +20,24 @@ from src.data import CS_VideoData, OpenDV_VideoData, opendv_collate
 from src.dino_f import Dino_f
 
 
+OPENDV_CMD_CAPTION_MAP = {
+    0: "Go straight.",
+    1: "Pass the intersection.",
+    2: "Turn left.",
+    3: "Turn right.",
+    4: "Change to the left lane.",
+    5: "Change to the right lane.",
+    6: "Go to the left lane branch.",
+    7: "Go to the right lane branch.",
+    8: "Pass the crosswalk.",
+    9: "Pass the railroad.",
+    10: "Merge.",
+    11: "Make a U-turn.",
+    12: "Stop.",
+    13: "Deviate.",
+}
+
+
 def parse_tuple(value):
     if value is None or isinstance(value, tuple):
         return value
@@ -368,12 +386,31 @@ def build_dataset(eval_args: argparse.Namespace, split: str):
     return dataset, collate_fn
 
 
+def decode_opendv_cmd_value(cmd_value: Any) -> Optional[str]:
+    if cmd_value is None:
+        return None
+    if isinstance(cmd_value, (int, np.integer)):
+        return OPENDV_CMD_CAPTION_MAP.get(int(cmd_value))
+    text = str(cmd_value).strip()
+    if not text:
+        return None
+    try:
+        cmd_id = int(text)
+    except ValueError:
+        return None
+    return OPENDV_CMD_CAPTION_MAP.get(cmd_id)
+
+
 def candidate_texts_for_dataset_index(dataset, dataset_index: int, text_field: str) -> List[str]:
     if hasattr(dataset, "clips") and getattr(dataset, "use_annotations", False):
         clip = dataset.clips[dataset_index]
         values = []
         if text_field in {"cmd", "either"}:
-            values.append(clip.get("cmd"))
+            cmd_value = clip.get("cmd")
+            values.append(cmd_value)
+            decoded_cmd = decode_opendv_cmd_value(cmd_value)
+            if decoded_cmd:
+                values.append(decoded_cmd)
         if text_field in {"blip", "either"}:
             values.append(clip.get("blip"))
         return [str(value) for value in values if value]
