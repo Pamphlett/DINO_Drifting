@@ -116,6 +116,27 @@ def build_parser(config_defaults: Optional[Dict[str, Any]] = None) -> argparse.A
     parser.add_argument("--eval_subset_size", type=int, default=100)
     parser.add_argument("--eval_subset_seed", type=int, default=123)
     parser.add_argument("--eval_subset_index_file", type=str, default=None, help="JSON file used to save/reuse deterministic evaluation indices.")
+    parser.add_argument(
+        "--eval_cmd_substrings",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional OpenDV text filters. Only samples whose cmd/blip matches these substrings remain eligible.",
+    )
+    parser.add_argument(
+        "--eval_text_field",
+        type=str,
+        default="cmd",
+        choices=["cmd", "blip", "either"],
+        help="Which text field to use when filtering eval samples by substring.",
+    )
+    parser.add_argument(
+        "--eval_cmd_groups",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional balanced cmd groups, e.g. straight=straight,go_straight turn=turn,left,right",
+    )
     parser.add_argument("--eval_sampling_seed", type=int, default=0, help="Base seed for stochastic sampling during quantitative evaluation.")
     parser.add_argument("--rgb_decoder_path", type=str, default=None, help="Optional RGB decoder checkpoint. If unavailable, latent-only evaluation still runs.")
     parser.add_argument("--pca_ckpt", type=str, default=None, help="Optional PCA checkpoint override if the predictor checkpoint expects one.")
@@ -347,15 +368,148 @@ def build_dataset(eval_args: argparse.Namespace, split: str):
     return dataset, collate_fn
 
 
+def candidate_texts_for_dataset_index(dataset, dataset_index: int, text_field: str) -> List[str]:
+    if hasattr(dataset, "clips") and getattr(dataset, "use_annotations", False):
+        clip = dataset.clips[dataset_index]
+        values = []
+        if text_field in {"cmd", "either"}:
+            values.append(clip.get("cmd"))
+        if text_field in {"blip", "either"}:
+            values.append(clip.get("blip"))
+        return [str(value) for value in values if value]
+    return []
+
+
+def parse_cmd_group_specs(group_specs: Optional[Sequence[str]]) -> List[Tuple[str, List[str]]]:
+    if not group_specs:
+        return []
+    groups = []
+    for spec in group_specs:
+        if "=" not in spec:
+            raise ValueError(f"Invalid --eval_cmd_groups spec '{spec}'. Expected name=token1,token2")
+        name, raw_tokens = spec.split("=", 1)
+        name = name.strip()
+        tokens = [token.strip().lower() for token in raw_tokens.split(",") if token.strip()]
+        if not name or not tokens:
+            raise ValueError(f"Invalid --eval_cmd_groups spec '{spec}'.")
+        groups.append((name, tokens))
+    return groups
+
+
+def filter_eval_candidates(dataset, args) -> List[int]:
+    all_indices = list(range(len(dataset)))
+    if not args.eval_cmd_substrings:
+        return all_indices
+
+    filters = [token.lower() for token in args.eval_cmd_substrings if token.strip()]
+    if not filters:
+        return all_indices
+
+    matched = []
+    for dataset_index in all_indices:
+        texts = candidate_texts_for_dataset_index(dataset, dataset_index, args.eval_text_field)
+        haystack = " || ".join(texts).lower()
+        if haystack and any(token in haystack for token in filters):
+            matched.append(dataset_index)
+
+    if not matched:
+        raise ValueError(
+            f"No dataset samples matched eval text filters {args.eval_cmd_substrings} "
+            f"using field={args.eval_text_field}."
+        )
+
+    log(
+        f"Filtered eval candidates by {args.eval_text_field}: "
+        f"{len(matched)}/{len(all_indices)} samples matched {args.eval_cmd_substrings}"
+    )
+    return matched
+
+
+def build_group_buckets(dataset, candidate_indices: Sequence[int], args) -> Dict[str, List[int]]:
+    group_specs = parse_cmd_group_specs(args.eval_cmd_groups)
+    if not group_specs:
+        return {}
+
+    buckets: Dict[str, List[int]] = {name: [] for name, _ in group_specs}
+    for dataset_index in candidate_indices:
+        texts = candidate_texts_for_dataset_index(dataset, dataset_index, args.eval_text_field)
+        haystack = " || ".join(texts).lower()
+        if not haystack:
+            continue
+        for name, tokens in group_specs:
+            if any(token in haystack for token in tokens):
+                buckets[name].append(dataset_index)
+                break
+
+    empty_groups = [name for name, indices in buckets.items() if not indices]
+    if empty_groups:
+        raise ValueError(f"No dataset samples matched eval cmd groups: {empty_groups}")
+
+    for name, indices in buckets.items():
+        log(f"Eval cmd group '{name}': {len(indices)} matched candidates")
+    return buckets
+
+
+def sample_balanced_group_indices(
+    buckets: Dict[str, List[int]],
+    subset_size: int,
+    seed: int,
+) -> List[int]:
+    if subset_size <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    ordered_names = list(buckets.keys())
+    shuffled_buckets: Dict[str, List[int]] = {}
+    for name in ordered_names:
+        arr = np.array(sorted(set(buckets[name])), dtype=int)
+        rng.shuffle(arr)
+        shuffled_buckets[name] = arr.tolist()
+
+    quotas = {name: 0 for name in ordered_names}
+    remaining = subset_size
+    active = ordered_names[:]
+    while remaining > 0 and active:
+        progressed = False
+        share = max(1, remaining // len(active))
+        next_active = []
+        for name in active:
+            capacity = len(shuffled_buckets[name]) - quotas[name]
+            if capacity <= 0:
+                continue
+            take = min(capacity, share, remaining)
+            if take > 0:
+                quotas[name] += take
+                remaining -= take
+                progressed = True
+            if len(shuffled_buckets[name]) - quotas[name] > 0:
+                next_active.append(name)
+            if remaining == 0:
+                break
+        active = next_active
+        if not progressed:
+            break
+
+    if remaining > 0:
+        raise ValueError("Not enough samples across cmd groups to satisfy eval_subset_size.")
+
+    indices = []
+    for name in ordered_names:
+        indices.extend(shuffled_buckets[name][:quotas[name]])
+    indices = sorted(indices)
+    return indices
+
+
 def save_json(path: Path, payload: Dict[str, Any]) -> None:
     ensure_dir(path.parent)
     with path.open("w") as handle:
         json.dump(payload, handle, indent=2)
 
 
-def load_or_create_eval_indices(dataset_len: int, args, output_dir: Path) -> List[int]:
+def load_or_create_eval_indices(dataset, args, output_dir: Path) -> List[int]:
+    dataset_len = len(dataset)
     if dataset_len <= 0:
         raise ValueError("Dataset is empty.")
+    candidate_indices = filter_eval_candidates(dataset, args)
     index_path = Path(args.eval_subset_index_file) if args.eval_subset_index_file else output_dir / "eval_subset_indices.json"
     if index_path.is_file():
         payload = json.load(index_path.open("r"))
@@ -367,17 +521,38 @@ def load_or_create_eval_indices(dataset_len: int, args, output_dir: Path) -> Lis
             raise ValueError(
                 f"Existing subset indices in {index_path} are incompatible with current dataset length {dataset_len}."
             )
+        if isinstance(payload, dict):
+            stored_filters = payload.get("eval_cmd_substrings")
+            stored_field = payload.get("eval_text_field")
+            stored_groups = payload.get("eval_cmd_groups")
+            if (
+                stored_filters != args.eval_cmd_substrings
+                or stored_field != args.eval_text_field
+                or stored_groups != args.eval_cmd_groups
+            ):
+                raise ValueError(
+                    f"Existing subset index file {index_path} was created with different text filters: "
+                    f"{stored_filters} field={stored_field} groups={stored_groups}"
+                )
         log(f"Reusing evaluation subset from {index_path} ({len(indices)} samples).")
         return indices
 
-    subset_size = min(int(args.eval_subset_size), dataset_len)
-    rng = np.random.default_rng(args.eval_subset_seed)
-    indices = sorted(rng.choice(dataset_len, size=subset_size, replace=False).tolist())
+    subset_size = min(int(args.eval_subset_size), len(candidate_indices))
+    buckets = build_group_buckets(dataset, candidate_indices, args)
+    if buckets:
+        indices = sample_balanced_group_indices(buckets, subset_size, args.eval_subset_seed)
+    else:
+        rng = np.random.default_rng(args.eval_subset_seed)
+        indices = sorted(rng.choice(np.array(candidate_indices), size=subset_size, replace=False).tolist())
     payload = {
         "dataset_length": dataset_len,
+        "candidate_pool_size": len(candidate_indices),
         "subset_size": subset_size,
         "subset_seed": args.eval_subset_seed,
         "data_split": args.data_split,
+        "eval_cmd_substrings": args.eval_cmd_substrings,
+        "eval_text_field": args.eval_text_field,
+        "eval_cmd_groups": args.eval_cmd_groups,
         "indices": indices,
     }
     save_json(index_path, payload)
@@ -1159,7 +1334,7 @@ def main():
     first_payload = load_checkpoint_payload(selected_checkpoints[0]["path"])
     first_args = apply_cli_overrides(extract_checkpoint_args(first_payload), args)
     first_dataset, _ = build_dataset(first_args, args.data_split)
-    eval_indices = load_or_create_eval_indices(len(first_dataset), args, output_dir)
+    eval_indices = load_or_create_eval_indices(first_dataset, args, output_dir)
     qual_indices = select_qualitative_indices(eval_indices, args.qual_num_samples, args.qual_seed, output_dir)
 
     decoder = load_optional_decoder(args.rgb_decoder_path, device)
