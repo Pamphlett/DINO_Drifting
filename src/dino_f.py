@@ -1,6 +1,7 @@
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
+from contextlib import nullcontext
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -593,7 +594,15 @@ class Dino_f(pl.LightningModule):
             self._init_feature_extractor()
         with torch.no_grad():
             if self.args.feature_extractor == 'dino':
-                x = self.dino_v2.get_intermediate_layers(x,n=self.d_layers, reshape=reshape)
+                dino_dtype = self.dino_v2.patch_embed.proj.weight.dtype
+                x = x.to(device=self.dino_v2.patch_embed.proj.weight.device, dtype=dino_dtype)
+                autocast_ctx = (
+                    torch.autocast(device_type="cuda", enabled=False)
+                    if x.is_cuda
+                    else nullcontext()
+                )
+                with autocast_ctx:
+                    x = self.dino_v2.get_intermediate_layers(x, n=self.d_layers, reshape=reshape)
             elif self.args.feature_extractor == 'eva2-clip':
                 x = self.eva2clip.forward_intermediates(x, indices=self.d_layers, output_fmt  = 'NLC', norm=True, intermediates_only=True)
             elif self.args.feature_extractor == 'sam':
