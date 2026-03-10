@@ -62,7 +62,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="${NGPU}" --master_addr "${MAS
   --num_gpus "${NGPU}" --strategy ddp --ddp_timeout 120 --find_unused_parameters \
   --precision 16-mixed --num_workers 6 --num_workers_val 6 --dataloader_timeout 120 \
   --dataloader_log_path "${DATALOADER_LOG_PATH}" --dataloader_log_every 500 \
-  --ddp_stage_log_path "${DDP_STAGE_LOG_PATH}" \
+ssadasdfjioadskoasdjfoggg111111  --ddp_stage_log_path "${DDP_STAGE_LOG_PATH}" \
   --batch_size 16 --sequence_length 5 --img_size 224,448 \
   --hidden_dim 1152 --heads 8 --layers 12 --dropout 0.1 \
   --single_step_sample_train --lr_base 8e-5 --use_drifting_loss --noise_dim 256 --drift_temperatures 0.02,0.05,0.2 \

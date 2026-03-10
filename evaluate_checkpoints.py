@@ -920,6 +920,9 @@ def evaluate_checkpoint(
     rgb_l1_values: List[float] = []
     rgb_mse_values: List[float] = []
     rgb_psnr_values: List[float] = []
+    gt_decoder_l1_values: List[float] = []
+    gt_decoder_mse_values: List[float] = []
+    gt_decoder_psnr_values: List[float] = []
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
@@ -973,6 +976,14 @@ def evaluate_checkpoint(
                 rgb_mse_values.append(float(rgb_mse.item()))
                 rgb_psnr_values.append(float(rgb_psnr.item()))
 
+                gt_decoded_rgb = decoder.decode(gt_feats.to(device)).detach().float().cpu()
+                gt_decoder_l1 = F.l1_loss(gt_decoded_rgb, gt_rgb)
+                gt_decoder_mse = F.mse_loss(gt_decoded_rgb, gt_rgb)
+                gt_decoder_psnr = -10.0 * torch.log10(gt_decoder_mse.clamp(min=1e-8))
+                gt_decoder_l1_values.append(float(gt_decoder_l1.item()))
+                gt_decoder_mse_values.append(float(gt_decoder_mse.item()))
+                gt_decoder_psnr_values.append(float(gt_decoder_psnr.item()))
+
     diversity_mean = None
     if qual_indices and cli_args.num_samples_per_input > 1:
         diversity_values = render_or_collect_qualitative(
@@ -1015,6 +1026,9 @@ def evaluate_checkpoint(
         "rgb_l1": metric_mean(rgb_l1_values),
         "rgb_mse": metric_mean(rgb_mse_values),
         "rgb_psnr": metric_mean(rgb_psnr_values),
+        "gt_decoder_l1": metric_mean(gt_decoder_l1_values),
+        "gt_decoder_mse": metric_mean(gt_decoder_mse_values),
+        "gt_decoder_psnr": metric_mean(gt_decoder_psnr_values),
         "sample_diversity_cosine": diversity_mean,
     }
     return result, eval_args
@@ -1060,6 +1074,7 @@ def render_or_collect_qualitative(
                     "dataset_index": dataset_index,
                     "context_images": None,
                     "gt_image": None,
+                    "gt_decoded_image": None,
                     "gt_latent": None,
                     "predictions": {},
                     "visual_mode": "rgb_decoder" if decoder is not None else "latent_pca",
@@ -1075,6 +1090,9 @@ def render_or_collect_qualitative(
                 if getattr(model.args, "crop_feats", False):
                     gt_feats = model.crop_feats(gt_feats.unsqueeze(1), use_crop_params=True).squeeze(1)
                 sample_record["gt_latent"] = gt_feats[0].detach().cpu().to(torch.float16)
+                if decoder is not None:
+                    gt_decoded = decoder.decode(gt_feats.to(device))[0].cpu()
+                    sample_record["gt_decoded_image"] = tensor_to_pil(gt_decoded)
 
             latent_samples: List[torch.Tensor] = []
             decoded_samples: List[Image.Image] = []
@@ -1122,6 +1140,9 @@ def write_results_csv(path: Path, results: Sequence[Dict[str, Any]]) -> None:
         "rgb_l1",
         "rgb_mse",
         "rgb_psnr",
+        "gt_decoder_l1",
+        "gt_decoder_mse",
+        "gt_decoder_psnr",
         "sample_diversity_cosine",
     ]
     with path.open("w", newline="") as handle:
@@ -1145,6 +1166,7 @@ def write_results_markdown(path: Path, results: Sequence[Dict[str, Any]]) -> Non
         "latent_cosine",
         "motion_mag_ratio",
         "rgb_psnr",
+        "gt_decoder_psnr",
         "sample_diversity_cosine",
     ]
     lines = [
@@ -1162,6 +1184,7 @@ def write_results_markdown(path: Path, results: Sequence[Dict[str, Any]]) -> Non
                     format_metric(row.get("latent_cosine")),
                     format_metric(row.get("motion_mag_ratio")),
                     format_metric(row.get("rgb_psnr")),
+                    format_metric(row.get("gt_decoder_psnr")),
                     format_metric(row.get("sample_diversity_cosine")),
                 ]
             )
@@ -1265,6 +1288,14 @@ def save_summary_markdown(
     qualitative_dir: Path,
 ) -> None:
     best = trend_summary["best"]
+    decoder_upper_bound_psnr = None
+    decoder_upper_bound_candidates = [
+        row["gt_decoder_psnr"]
+        for row in trend_summary["sorted_results"]
+        if row.get("gt_decoder_psnr") is not None
+    ]
+    if decoder_upper_bound_candidates:
+        decoder_upper_bound_psnr = max(decoder_upper_bound_candidates)
     issue_flags = heuristic_issue_flags(best)
     recommendation_map = {
         "continue_training_from_latest_checkpoint": "continue training from the latest checkpoint",
@@ -1294,6 +1325,7 @@ def save_summary_markdown(
             f"- step: `{best.get('step')}`",
             f"- latent_mse: `{format_metric(best.get('latent_mse'))}`",
             f"- latent_cosine: `{format_metric(best.get('latent_cosine'))}`",
+            f"- gt_decoder_psnr_upper_bound: `{format_metric(decoder_upper_bound_psnr)}`",
             f"- trend: {trend_summary['trend_text']}",
             f"- qualitative agreement: {qualitative_agreement_text(trend_summary['sorted_results'])}",
             f"- recommendation: {recommendation_map[trend_summary['recommendation_code']]}",
@@ -1325,6 +1357,9 @@ def render_qualitative_outputs(qual_cache: Dict[int, Dict[str, Any]], output_dir
         ensure_dir(sample_dir)
         context_strip = hstack([add_label(image, f"context_{idx}") for idx, image in enumerate(record["context_images"])])
         gt_image = add_label(record["gt_image"], "gt_future")
+        gt_decoded_image = None
+        if decoder is not None and record.get("gt_decoded_image") is not None:
+            gt_decoded_image = add_label(record["gt_decoded_image"], "gt_dino_decoded")
 
         per_ckpt_main_images = []
         pca_inputs = [record["gt_latent"].float()]
@@ -1341,6 +1376,8 @@ def render_qualitative_outputs(qual_cache: Dict[int, Dict[str, Any]], output_dir
             ensure_dir(ckpt_dir)
             context_strip.save(ckpt_dir / "context.png")
             gt_image.save(ckpt_dir / "gt_future.png")
+            if gt_decoded_image is not None:
+                gt_decoded_image.save(ckpt_dir / "gt_dino_decoded.png")
 
             latents = [latent.float() for latent in pred["latents"]]
             if decoder is not None:
@@ -1366,7 +1403,11 @@ def render_qualitative_outputs(qual_cache: Dict[int, Dict[str, Any]], output_dir
                 hstack(labeled_images).save(ckpt_dir / "pred_samples_strip.png")
             per_ckpt_main_images.append(pred_main)
 
-        bottom_row = hstack([gt_image] + per_ckpt_main_images)
+        bottom_items = [gt_image]
+        if gt_decoded_image is not None:
+            bottom_items.append(gt_decoded_image)
+        bottom_items.extend(per_ckpt_main_images)
+        bottom_row = hstack(bottom_items)
         combined = vstack([add_label(context_strip, "context_frames"), bottom_row])
         combined_path = sample_dir / "combined.png"
         combined.save(combined_path)

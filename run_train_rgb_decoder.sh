@@ -18,7 +18,9 @@ echo "RGB decoder logs/checkpoints will be saved to: ${DST_PATH}"
 CUDA_VISIBLE_DEVICES=1,2,3,4 python train_rgb_decoder.py \
   --train_root /mnt/hdd1/pengyu/OpenDV-YouTube/full_images \
   --val_root /mnt/hdd1/pengyu/OpenDV-YouTube/val_images \
-  --img_size 224,448 \
+  --img_size 224,448 \      
+
+      sdfc23147890
   --dinov2_variant vitb14_reg \
   --d_layers 2,5,8,11 \
   --batch_size 8 \
